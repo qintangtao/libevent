@@ -15,6 +15,9 @@ void evhttp_thread_pool_free(struct evhttp_thread_pool *evpool);
 void evhttp_thread_dispatch_socket(
 	struct evhttp_thread_pool *evpool, evutil_socket_t nfd, struct sockaddr *addr, int addrlen);
 
+int
+evhttp_thread_get_connection_count(struct evhttp_thread_pool *evpool);
+
 #ifdef __cplusplus
 }
 #endif

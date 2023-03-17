@@ -81,7 +81,7 @@
 #endif
 #endif /* _WIN32 */
 
-
+struct evhttp_thread_pool *g_pool = NULL;
 
 char uri_root[512];
 
@@ -151,6 +151,8 @@ dump_request_cb(struct evhttp_request *req, void *arg)
 	struct evkeyvalq *headers;
 	struct evkeyval *header;
 	struct evbuffer *buf;
+	struct evbuffer *evb = NULL;
+	struct timeval lasttime;
 
 	switch (evhttp_request_get_command(req)) {
 	case EVHTTP_REQ_GET:
@@ -185,15 +187,42 @@ dump_request_cb(struct evhttp_request *req, void *arg)
 		break;
 	}
 
+	evb = evbuffer_new();
+
+	evbuffer_add_printf(evb,
+		"<!DOCTYPE html>\n"
+		"<html>\n <head>\n"
+		"  <meta charset='utf-8'>\n"
+		"  <title>Received a %s request for %s\nHeaders:</title>\n"
+		" </head>\n"
+		" <body>\n",
+		cmdtype, evhttp_request_get_uri(req));
+
 	printf("Received a %s request for %s\nHeaders:\n", cmdtype,
 		evhttp_request_get_uri(req));
 
 	headers = evhttp_request_get_input_headers(req);
 	for (header = headers->tqh_first; header; header = header->next.tqe_next) {
 		printf("  %s: %s\n", header->key, header->value);
+		evbuffer_add_printf(
+			evb, "  <p>%s: %s</p>\n", header->key, header->value);
 	}
 
 	printf("  threadid: %d\n", EVTHREAD_GET_ID());
+
+	evbuffer_add_printf(
+		evb, "  <p>%s: %d</p>\n", "threadid", EVTHREAD_GET_ID());
+
+	if (g_pool) {
+		evbuffer_add_printf(evb, "  <p>%s: %d</p>\n", "connection_count",
+			evhttp_thread_get_connection_count(g_pool));
+	}
+
+	evutil_gettimeofday(&lasttime, NULL);
+	evbuffer_add_printf(evb, "  <p>%s: %016llx</p>\n", "time",
+		lasttime.tv_sec * 1000 * 1000 + lasttime.tv_usec);
+
+	evbuffer_add_printf(evb, "</body></html>\n");
 
 	buf = evhttp_request_get_input_buffer(req);
 	puts("Input data: <<<");
@@ -206,7 +235,10 @@ dump_request_cb(struct evhttp_request *req, void *arg)
 	}
 	puts(">>>");
 
-	evhttp_send_reply(req, 200, "OK", NULL);
+	evhttp_send_reply(req, 200, "OK", evb);
+
+	if (evb)
+		evbuffer_free(evb);
 }
 
 /* This callback gets invoked when we get any http request that doesn't match
@@ -380,15 +412,15 @@ send_document_cb(struct evhttp_request *req, void *arg)
 
 			这里边 2048-4096 表示当前发送的数据范围， 10240 表示文件总大小。
 		*/
-		char *range =
+		const char *range =
 			evhttp_find_header(evhttp_request_get_input_headers(req), "Range");
 		if (range != NULL) {
 			printf("Range: <%s>\n", range);
 
 			ev_off_t offset2 = 0;
-			sscanf(range, "bytes=%d-%d", &offset, &offset2);
+			sscanf(range, "bytes=%lld-%lld", &offset, &offset2);
 			if (offset == 0 && offset2 == 0)
-				sscanf(range, "bytes=%d-", &offset);
+				sscanf(range, "bytes=%lld-", &offset);
 
 			if (offset2 > offset)
 				length = offset2 - offset + 1;
@@ -400,7 +432,7 @@ send_document_cb(struct evhttp_request *req, void *arg)
 		if (offset + length > st.st_size)
 			length = st.st_size - offset;
 
-		printf("offset:%d, length:%d\n", offset, length);
+		printf("offset:%lld, length:%lld\n", offset, length);
 
 		evhttp_add_header(
 			evhttp_request_get_output_headers(req), "Content-Type", type);
@@ -589,6 +621,7 @@ main(int argc, char **argv)
 	struct options o = parse_opts(argc, argv);
 	int ret = 0;
 
+
 #ifdef _WIN32
 	{
 		WORD wVersionRequested;
@@ -597,7 +630,8 @@ main(int argc, char **argv)
 		WSAStartup(wVersionRequested, &wsaData);
 	}
 #else
-	if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
+		if (signal(SIGPIPE, SIG_IGN) == SIG_ERR)
+	{
 		ret = 1;
 		goto err;
 	}
@@ -702,9 +736,11 @@ main(int argc, char **argv)
 		ret = 1;
 	}
 
-    // reset connlistener cb
+	// reset connlistener cb
 	evconnlistener_set_cb(
 		evhttp_bound_socket_get_listener(handle), accept_socket_cb, pool);
+
+	g_pool = pool;
 
 	if (display_listen_sock(handle)) {
 		ret = 1;

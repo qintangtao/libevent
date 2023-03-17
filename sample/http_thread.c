@@ -364,3 +364,19 @@ error:
 	if (evsoc)
 		mm_free(evsoc);
 }
+
+
+int
+evhttp_thread_get_connection_count(struct evhttp_thread_pool *evpool)
+{
+	int i, cnt = 0;
+
+	if (evpool == NULL)
+		return cnt;
+
+	for (i = 0; i < evpool->thread_cnt; i++) {
+		cnt += evhttp_get_connection_count(evpool->threads[i].http);
+	}
+
+	return cnt;
+}
