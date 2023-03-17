@@ -148,6 +148,7 @@ not_found:
 static void
 dump_request_cb(struct evhttp_request *req, void *arg)
 {
+	struct evhttp *http = arg;
 	const char *cmdtype;
 	struct evkeyvalq *headers;
 	struct evkeyval *header;
@@ -211,13 +212,12 @@ dump_request_cb(struct evhttp_request *req, void *arg)
 
 	evb = evbuffer_new();
 
-	evbuffer_add_printf(evb,
-		"<!DOCTYPE html>\n"
-		"<html>\n <head>\n"
-		"  <meta charset='utf-8'>\n"
-		"  <title>dump</title>\n"
-		" </head>\n"
-		" <body>\n");
+	evbuffer_add_printf(evb, "<!DOCTYPE html>\n"
+							 "<html>\n <head>\n"
+							 "  <meta charset='utf-8'>\n"
+							 "  <title>dump</title>\n"
+							 " </head>\n"
+							 " <body>\n");
 
 	printf("Received a %s request for %s\nHeaders:\n", cmdtype, uri);
 
@@ -225,7 +225,7 @@ dump_request_cb(struct evhttp_request *req, void *arg)
 	evbuffer_add_printf(
 		evb, " <h1>Received a %s request for %s\n</h1>\n", cmdtype, uri);
 
-	evbuffer_add_printf(evb," <h3>Headers:</h3>\n");
+	evbuffer_add_printf(evb, " <h3>Headers:</h3>\n");
 
 	headers = evhttp_request_get_input_headers(req);
 	for (header = headers->tqh_first; header; header = header->next.tqe_next) {
@@ -235,7 +235,7 @@ dump_request_cb(struct evhttp_request *req, void *arg)
 	}
 
 	evbuffer_add_printf(evb, " <h3>Parameters:</h3>\n");
-	 
+
 	TAILQ_FOREACH (param, &params, next) {
 		evbuffer_add_printf(evb, "  <p>%s: %s</p>\n", param->key, param->value);
 	}
@@ -244,18 +244,25 @@ dump_request_cb(struct evhttp_request *req, void *arg)
 	evbuffer_add_printf(evb, "  <p>%s: %s</p>\n", "uri", uri);
 	evbuffer_add_printf(evb, "  <p>%s: %s</p>\n", "path", path);
 	evbuffer_add_printf(evb, "  <p>%s: %s</p>\n", "query", query);
-	evbuffer_add_printf(evb, "  <p>%s: %d</p>\n", "thread id", EVTHREAD_GET_ID());
+	evbuffer_add_printf(
+		evb, "  <p>%s: %d</p>\n", "thread id", EVTHREAD_GET_ID());
 
 	if (g_pool) {
 		evbuffer_add_printf(evb, "  <p>%s: %d</p>\n", "connection count",
 			evhttp_thread_get_connection_count(g_pool));
+	} else {
+		evbuffer_add_printf(evb, "  <p>%s: %d</p>\n", "connection count",
+			evhttp_get_connection_count(http));
 	}
-
+	
 	evutil_gettimeofday(&lasttime, NULL);
 	evbuffer_add_printf(evb, "  <p>%s: %016llx</p>\n", "response time",
 		lasttime.tv_sec * 1000 * 1000 + lasttime.tv_usec);
 
 	evbuffer_add_printf(evb, "</body></html>\n");
+
+	evhttp_add_header(
+		evhttp_request_get_output_headers(req), "Content-Type", "text/html");
 
 	buf = evhttp_request_get_input_buffer(req);
 	puts("Input data: <<<");
@@ -665,8 +672,7 @@ main(int argc, char **argv)
 		WSAStartup(wVersionRequested, &wsaData);
 	}
 #else
-		if (signal(SIGPIPE, SIG_IGN) == SIG_ERR)
-	{
+	if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
 		ret = 1;
 		goto err;
 	}
@@ -716,7 +722,7 @@ main(int argc, char **argv)
 	evhttp_set_timeout(http, 30);
 
 	/* The /dump URI will dump all requests to stdout and say 200 ok. */
-	evhttp_set_cb(http, "/dump", dump_request_cb, NULL);
+	evhttp_set_cb(http, "/dump", dump_request_cb, http);
 
 	/* We want to accept arbitrary requests, so we need to set a "generic"
 	 * cb.  We can also add callbacks for specific paths. */
@@ -771,13 +777,14 @@ main(int argc, char **argv)
 	if (!pool) {
 		fprintf(stderr, "couldn't create pool. Exiting.\n");
 		ret = 1;
+	} else {
+
+		g_pool = pool;
+
+		// reset connlistener cb
+		evconnlistener_set_cb(
+			evhttp_bound_socket_get_listener(handle), accept_socket_cb, pool);
 	}
-
-	// reset connlistener cb
-	evconnlistener_set_cb(
-		evhttp_bound_socket_get_listener(handle), accept_socket_cb, pool);
-
-	g_pool = pool;
 
 	if (display_listen_sock(handle)) {
 		ret = 1;
