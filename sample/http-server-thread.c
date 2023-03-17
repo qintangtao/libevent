@@ -774,10 +774,7 @@ main(int argc, char **argv)
 
 	// create http thread pool
 	pool = evhttp_thread_pool_new(http, 128);
-	if (!pool) {
-		fprintf(stderr, "couldn't create pool. Exiting.\n");
-		ret = 1;
-	} else {
+	if (pool) {
 
 		g_pool = pool;
 
