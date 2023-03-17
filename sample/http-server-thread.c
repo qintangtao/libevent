@@ -9,6 +9,7 @@
 /* Compatibility for possible missing IPv6 declarations */
 #include "../util-internal.h"
 #include "../evthread-internal.h"
+#include "../compat/sys/queue.h"
 #include "http_thread.h"
 
 #include <stdio.h>
@@ -103,10 +104,10 @@ static const struct table_entry {
 	{"ps", "application/postscript"},
 	{"js", "application/javascript"},
 	{"xml", "application/xml"},
+	{"json", "application/json"},
 	{NULL, NULL},
 };
 
-// application/json
 // application/x-www-form-urlencoded
 // Content-Type=multipart/form-data;
 // boundary=----WebKitFormBoundaryEbKBn4s3ZCuW5a4Y
@@ -152,7 +153,28 @@ dump_request_cb(struct evhttp_request *req, void *arg)
 	struct evkeyval *header;
 	struct evbuffer *buf;
 	struct evbuffer *evb = NULL;
+	struct evhttp_uri *decoded = NULL;
+	const char *uri = evhttp_request_get_uri(req);
+	const char *path;
+	const char *query;
 	struct timeval lasttime;
+	struct evkeyvalq params;
+	struct evkeyval *param;
+
+	TAILQ_INIT(&params);
+
+	/* Decode the URI */
+	decoded = evhttp_uri_parse(uri);
+	if (!decoded) {
+		printf("It's not a good URI. Sending BADREQUEST\n");
+		evhttp_send_error(req, HTTP_BADREQUEST, 0);
+		return;
+	}
+
+	path = evhttp_uri_get_path(decoded);
+	query = evhttp_uri_get_query(decoded);
+
+	evhttp_parse_query_str(query, &params);
 
 	switch (evhttp_request_get_command(req)) {
 	case EVHTTP_REQ_GET:
@@ -193,13 +215,17 @@ dump_request_cb(struct evhttp_request *req, void *arg)
 		"<!DOCTYPE html>\n"
 		"<html>\n <head>\n"
 		"  <meta charset='utf-8'>\n"
-		"  <title>Received a %s request for %s\nHeaders:</title>\n"
+		"  <title>dump</title>\n"
 		" </head>\n"
-		" <body>\n",
-		cmdtype, evhttp_request_get_uri(req));
+		" <body>\n");
 
-	printf("Received a %s request for %s\nHeaders:\n", cmdtype,
-		evhttp_request_get_uri(req));
+	printf("Received a %s request for %s\nHeaders:\n", cmdtype, uri);
+
+
+	evbuffer_add_printf(
+		evb, " <h1>Received a %s request for %s\n</h1>\n", cmdtype, uri);
+
+	evbuffer_add_printf(evb," <h3>Headers:</h3>\n");
 
 	headers = evhttp_request_get_input_headers(req);
 	for (header = headers->tqh_first; header; header = header->next.tqe_next) {
@@ -208,18 +234,25 @@ dump_request_cb(struct evhttp_request *req, void *arg)
 			evb, "  <p>%s: %s</p>\n", header->key, header->value);
 	}
 
-	printf("  threadid: %d\n", EVTHREAD_GET_ID());
+	evbuffer_add_printf(evb, " <h3>Parameters:</h3>\n");
+	 
+	TAILQ_FOREACH (param, &params, next) {
+		evbuffer_add_printf(evb, "  <p>%s: %s</p>\n", param->key, param->value);
+	}
 
-	evbuffer_add_printf(
-		evb, "  <p>%s: %d</p>\n", "threadid", EVTHREAD_GET_ID());
+	evbuffer_add_printf(evb, " <h3>Others:</h3>\n");
+	evbuffer_add_printf(evb, "  <p>%s: %s</p>\n", "uri", uri);
+	evbuffer_add_printf(evb, "  <p>%s: %s</p>\n", "path", path);
+	evbuffer_add_printf(evb, "  <p>%s: %s</p>\n", "query", query);
+	evbuffer_add_printf(evb, "  <p>%s: %d</p>\n", "thread id", EVTHREAD_GET_ID());
 
 	if (g_pool) {
-		evbuffer_add_printf(evb, "  <p>%s: %d</p>\n", "connection_count",
+		evbuffer_add_printf(evb, "  <p>%s: %d</p>\n", "connection count",
 			evhttp_thread_get_connection_count(g_pool));
 	}
 
 	evutil_gettimeofday(&lasttime, NULL);
-	evbuffer_add_printf(evb, "  <p>%s: %016llx</p>\n", "time",
+	evbuffer_add_printf(evb, "  <p>%s: %016llx</p>\n", "response time",
 		lasttime.tv_sec * 1000 * 1000 + lasttime.tv_usec);
 
 	evbuffer_add_printf(evb, "</body></html>\n");
@@ -236,6 +269,8 @@ dump_request_cb(struct evhttp_request *req, void *arg)
 	puts(">>>");
 
 	evhttp_send_reply(req, 200, "OK", evb);
+
+	evhttp_clear_headers(&params);
 
 	if (evb)
 		evbuffer_free(evb);
