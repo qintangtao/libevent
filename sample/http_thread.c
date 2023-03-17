@@ -227,6 +227,9 @@ bool thread_setup(struct evhttp_thread *evthread, struct evhttp *http)
 
 	evhttp_set_max_body_size(evthread->http, http->default_max_body_size);
 
+	evhttp_set_read_timeout_tv(evthread->http, &http->timeout_read);
+	evhttp_set_write_timeout_tv(evthread->http, &http->timeout_write);
+
 	/* Listen for notifications from other threads */
 	evthread->notify_event =
 		event_new(evthread->base, evthread->notify_receive_fd,
@@ -364,7 +367,6 @@ error:
 	if (evsoc)
 		mm_free(evsoc);
 }
-
 
 int
 evhttp_thread_get_connection_count(struct evhttp_thread_pool *evpool)
