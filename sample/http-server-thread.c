@@ -82,7 +82,6 @@
 #endif
 #endif /* _WIN32 */
 
-struct evhttp_thread_pool *g_pool = NULL;
 
 char uri_root[512];
 
@@ -148,7 +147,7 @@ not_found:
 static void
 dump_request_cb(struct evhttp_request *req, void *arg)
 {
-	struct evhttp *http = arg;
+	struct evhttp_thread_pool *evpool = arg;
 	const char *cmdtype;
 	struct evkeyvalq *headers;
 	struct evkeyval *header;
@@ -247,12 +246,9 @@ dump_request_cb(struct evhttp_request *req, void *arg)
 	evbuffer_add_printf(
 		evb, "  <p>%s: %d</p>\n", "thread id", EVTHREAD_GET_ID());
 
-	if (g_pool) {
+	if (evpool) {
 		evbuffer_add_printf(evb, "  <p>%s: %d</p>\n", "connection count",
-			evhttp_thread_pool_get_connection_count(g_pool));
-	} else {
-		evbuffer_add_printf(evb, "  <p>%s: %d</p>\n", "connection count",
-			evhttp_get_connection_count(http));
+			evhttp_thread_pool_get_connection_count(evpool));
 	}
 	
 	evutil_gettimeofday(&lasttime, NULL);
@@ -657,11 +653,13 @@ main(int argc, char **argv)
 	struct event_config *cfg = NULL;
 	struct event_base *base = NULL;
 	struct evhttp *http = NULL;
+	struct evhttp *http_thread = NULL;
 	struct evhttp_bound_socket *handle = NULL;
 	struct evconnlistener *lev = NULL;
 	struct event *term = NULL;
 	struct options o = parse_opts(argc, argv);
 	int ret = 0;
+	int i, nthreads;
 
 
 #ifdef _WIN32
@@ -718,7 +716,7 @@ main(int argc, char **argv)
 		fprintf(stderr, "couldn't create evhttp. Exiting.\n");
 		ret = 1;
 	}
-
+#if 0
 	evhttp_set_timeout(http, 30);
 
 	/* The /dump URI will dump all requests to stdout and say 200 ok. */
@@ -729,6 +727,7 @@ main(int argc, char **argv)
 	evhttp_set_gencb(http, send_document_cb, &o);
 	if (o.max_body_size)
 		evhttp_set_max_body_size(http, o.max_body_size);
+#endif
 
 	if (o.unixsock) {
 #ifdef EVENT__HAVE_STRUCT_SOCKADDR_UN
@@ -773,10 +772,29 @@ main(int argc, char **argv)
 	}
 
 	// create http thread pool
-	pool = evhttp_thread_pool_new(http, cfg, 128);
+	pool = evhttp_thread_pool_new(cfg, 128);
 	if (pool) {
 
-		g_pool = pool;
+		nthreads = evhttp_thread_pool_get_thread_count(pool);
+
+		for (i = 0; i < nthreads; i++)
+		{
+			http_thread = evhttp_thread_pool_get_http(pool, i);
+			if (http_thread) {
+				evhttp_set_timeout(http_thread, 30);
+
+				/* The /dump URI will dump all requests to stdout and say 200
+				 * ok. */
+				evhttp_set_cb(http_thread, "/dump", dump_request_cb, pool);
+
+				/* We want to accept arbitrary requests, so we need to set a
+				 * "generic"
+				 * cb.  We can also add callbacks for specific paths. */
+				evhttp_set_gencb(http_thread, send_document_cb, &o);
+				if (o.max_body_size)
+					evhttp_set_max_body_size(http_thread, o.max_body_size);
+			}
+		}
 
 		// reset connlistener cb
 		evconnlistener_set_cb(

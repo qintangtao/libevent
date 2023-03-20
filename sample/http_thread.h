@@ -7,8 +7,7 @@
 extern "C" {
 #endif
 
-struct evhttp_thread_pool *evhttp_thread_pool_new(
-	struct evhttp *http, const struct event_config *cfg, int nthreads);
+struct evhttp_thread_pool *evhttp_thread_pool_new(const struct event_config *cfg, int nthreads);
 
 void evhttp_thread_pool_free(struct evhttp_thread_pool *evpool);
 

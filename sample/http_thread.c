@@ -42,7 +42,6 @@ struct evhttp_thread {
 };
 
 struct evhttp_thread_pool {
-	struct evhttp *http;
 	int thread_idx;
 	int thread_cnt;
 	struct evhttp_thread *threads;
@@ -146,14 +145,14 @@ thread_cleanup(struct evhttp_thread *evthread)
 	while (evthread->thread_id != 0)
 		evutil_usleep_(&msec10);
 
-	if (evthread->notify_receive_fd > 0) {
+	if (evthread->notify_receive_fd != EVUTIL_INVALID_SOCKET) {
 		evutil_closesocket(evthread->notify_receive_fd);
-		evthread->notify_receive_fd = 0;
+		evthread->notify_receive_fd = EVUTIL_INVALID_SOCKET;
 	}
 
-	if (evthread->notify_send_fd > 0) {
+	if (evthread->notify_send_fd != EVUTIL_INVALID_SOCKET) {
 		evutil_closesocket(evthread->notify_send_fd);
-		evthread->notify_send_fd = 0;
+		evthread->notify_send_fd = EVUTIL_INVALID_SOCKET;
 	}
 
 	if (evthread->notify_event) {
@@ -184,12 +183,9 @@ thread_cleanup(struct evhttp_thread *evthread)
 	}
 }
 
-static 
-bool
-thread_setup(struct evhttp_thread *evthread, struct evhttp *http,
-	const struct event_config *cfg)
+static bool
+thread_setup(struct evhttp_thread *evthread, const struct event_config *cfg)
 {
-	struct evhttp_cb *http_cb;
 	evutil_socket_t fds[2];
 
 #ifdef _WIN32
@@ -219,18 +215,6 @@ thread_setup(struct evhttp_thread *evthread, struct evhttp *http,
 		fprintf(stderr, "Can't allocate event http\n");
 		goto error;
 	}
-
-	TAILQ_FOREACH (http_cb, &http->callbacks, next) {
-		evhttp_set_cb(
-			evthread->http, http_cb->what, http_cb->cb, http_cb->cbarg);
-	}
-
-	evhttp_set_gencb(evthread->http, http->gencb, http->gencbarg);
-
-	evhttp_set_max_body_size(evthread->http, http->default_max_body_size);
-
-	evhttp_set_read_timeout_tv(evthread->http, &http->timeout_read);
-	evhttp_set_write_timeout_tv(evthread->http, &http->timeout_write);
 
 	/* Listen for notifications from other threads */
 	evthread->notify_event =
@@ -266,8 +250,7 @@ http_worker(void *arg)
 }
 
 struct evhttp_thread_pool *
-evhttp_thread_pool_new(
-	struct evhttp *http, const struct event_config *cfg, int nthreads)
+evhttp_thread_pool_new(const struct event_config *cfg, int nthreads)
 {
 	int i;
 	struct evhttp_thread_pool *evpool = NULL;
@@ -280,7 +263,6 @@ evhttp_thread_pool_new(
 	if (nthreads <= 0 || nthreads > MAX_THREAD_COUNT)
 		nthreads = MAX_THREAD_COUNT;
 
-	evpool->http = http;
 	evpool->thread_idx = 0;
 	evpool->thread_cnt = nthreads;
 	evpool->threads = mm_calloc(nthreads, sizeof(struct evhttp_thread));
@@ -291,10 +273,12 @@ evhttp_thread_pool_new(
 
 	for (i = 0; i < nthreads; i++) {
 		memset(&evpool->threads[i], 0, sizeof(struct evhttp_thread));
+		evpool->threads[i].notify_receive_fd = EVUTIL_INVALID_SOCKET;
+		evpool->threads[i].notify_send_fd = EVUTIL_INVALID_SOCKET;
 	}
 
 	for (i = 0; i < nthreads; i++) {
-		if (!thread_setup(&evpool->threads[i], http, cfg))
+		if (!thread_setup(&evpool->threads[i], cfg))
 			goto error;
 	}
 
