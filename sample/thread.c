@@ -1,315 +1,207 @@
 #include "thread.h"
 
-#include <stdio.h>
-#include <stdlib.h>
-#ifdef _WIN32
-
-#else
-#include <unistd.h>
-#endif
-
-#include <event2/bufferevent.h>
-#include <event2/bufferevent_compat.h>
-#include <event2/buffer.h>
 #include <event2/event.h>
+#include <event2/http.h>
+#include <event2/listener.h>
+#include <event2/buffer.h>
+#include <event2/util.h>
+#include <event2/keyvalq_struct.h>
+#include <event2/thread.h>
 #include <event2/event_compat.h>
+#include <event2/bufferevent.h>
 
+#include "../evthread-internal.h"
+#include "../mm-internal.h"
+#include "../time-internal.h"
+#include "../http-internal.h"
+#include "../compat/sys/queue.h"
 
-#define ITEMS_PER_ALLOC		64
-#define CONN_TIMEOUT_READ	30
-#define CONN_TIMEOUT_WRITE	0
+#include <stdbool.h>
 
-#define MAX_THREAD_COUNT	128
+#define MAX_THREAD_COUNT 128
+#define SOCKET_PER_ALLOC 64
 
-#ifdef _WIN32
-#define mutex_handle	HANDLE
-#define mutex_init(p)	p = CreateMutex(NULL, FALSE, NULL);
-#define mutex_enter(p)	WaitForSingleObject(p, INFINITE);
-#define mutex_leave(p)	ReleaseMutex(p);
-#else
-#define mutex_handle	pthread_mutex_t
-#define mutex_init(p)   pthread_mutex_init(&p, NULL);
-#define mutex_enter(p)	pthread_mutex_lock(&p, INFINITE);
-#define mutex_leave(p)	pthread_mutex_unlock(&p);
-#endif
+/* each bound socket is stored in one of these */
+struct eveasy_socket {
+	TAILQ_ENTRY(eveasy_socket) next;
 
-#pragma pack(push)
-#pragma pack(1)
-typedef struct _RPC_PACKET {
-	char magic[5];
-	unsigned char major_version;
-	unsigned char minor_version;
-	unsigned char major_cmd;
-	unsigned char minor_cmd;
-	unsigned char state;
-	unsigned int length;
-} RPC_PACKET;
-#pragma pack(pop)
-#define RPC_MAGIC "BRRCP"
-#define RPC_MAJOR_VERSION 0x01
-#define RPC_MINOR_VERSION 0x01
-
-typedef struct conn_queue_item CQ_ITEM;
-struct conn_queue_item {
-	evutil_socket_t sfd;
-	CQ_ITEM *next;
+	evutil_socket_t nfd;
+	struct sockaddr addr;
+	int addrlen;
 };
 
-typedef struct conn_queue CQ;
-struct conn_queue {
-	CQ_ITEM *head;
-	CQ_ITEM *tail;
-	mutex_handle lock;
+struct eveasy_socket_per {
+	TAILQ_ENTRY(eveasy_socket_per) next;
+
+	struct eveasy_socket *socket;
 };
 
-typedef struct {
-	int thread_id;					   /* unique ID of this thread */
+struct eveasy_thread {
+	int thread_id; /* unique ID of this thread */
 	struct event_base *base;		   /* libevent handle this thread uses */
 	struct event *notify_event;		   /* listen event for notify pipe */
 	evutil_socket_t notify_receive_fd; /* receiving end of notify pipe */
-	evutil_socket_t notify_send_fd;		/* sending end of notify pipe */
-	struct conn_queue *new_conn_queue; /* queue of new connections to handle */
-} LIBEVENT_THREAD;
+	evutil_socket_t notify_send_fd;	/* sending end of notify pipe */
+	struct eveasy_thread_pool *pool;
 
-static LIBEVENT_THREAD *threads = NULL;
-static int num_threads = 0;
-static int last_thread = 0;
-static const char MESSAGE[] = "Hello, World!\n";
+	TAILQ_HEAD(eveasy_socketq, eveasy_socket)
+	sockets; /* queue of new connections */
+	void *lock;
+};
 
-static CQ_ITEM *cqi_freelist = NULL;
-static mutex_handle cqi_freelist_lock;
+struct eveasy_thread_pool {
+	int thread_idx;
+	int thread_cnt;
+	struct eveasy_thread *threads;
 
+	bufferevent_socket_new_cb cb;
+	void *cbarg;
+
+	int socket_cnt;
+	TAILQ_HEAD(eveasy_socketf, eveasy_socket)
+	sockets; /* queue of free connections */
+	void *lock;
+
+	TAILQ_HEAD(eveasy_socket_refq, eveasy_socket_per)
+	socket_pers; /* queue of socket pers*/
+};
+
+#define EVeasy_THREAD_LOCK(b)        \
+	do {                             \
+		if (b)                       \
+			EVLOCK_LOCK(b->lock, 0); \
+	} while (0)
+
+#define EVeasy_THREAD_UNLOCK(b)        \
+	do {                               \
+		if (b)                         \
+			EVLOCK_UNLOCK(b->lock, 0); \
+	} while (0)
+
+
+static unsigned long
+sys_os_create_thread(void *(*func)(void *), void *arg)
+{
 #ifdef _WIN32
-#define I64_FMT "%I64d"
-#define I64_TYP __int64
+	HANDLE hThread;
+	DWORD threadid = 0;
+	hThread =
+		CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)func, arg, 0, &threadid);
+	if (hThread == INVALID_HANDLE_VALUE) {
+		fprintf(stderr, "Can't create thread: %d\n", GetLastError());
+		goto error;
+	}
+	CloseHandle(hThread);
+
+	return (unsigned long)threadid;
 #else
-#define I64_FMT "%lld"
-#define I64_TYP long long int
+	int ret;
+	pthread_t thread;
+	pthread_attr_t attr;
+	pthread_attr_init(&attr);
+	if ((ret = pthread_create(&thread, &attr, func, arg)) != 0) {
+		fprintf(stderr, "Can't create thread: %s\n", strerror(ret));
+		goto error;
+	}
+	pthread_detach(thread);
+
+	return (unsigned long)thread;
 #endif
 
-
-static void
-cq_init(CQ *cq)
-{
-	mutex_init(cq->lock);
-	cq->head = NULL;
-	cq->tail = NULL;
+error:
+	return 0;
 }
 
-static CQ_ITEM *
-cq_pop(CQ *cq)
+static struct eveasy_socket *
+eveasy_socket_new(struct eveasy_thread_pool *evpool)
 {
-	CQ_ITEM *item;
-	mutex_enter(cq->lock);
-	item = cq->head;
-	if (NULL != item) {
-		cq->head = item->next;
-		if (NULL == cq->head)
-			cq->tail = NULL;
+	struct eveasy_socket *evsocket = NULL;
+	struct eveasy_socket_per *evsocket_per;
+	int i;
+
+	EVeasy_THREAD_LOCK(evpool);
+	if ((evsocket = TAILQ_FIRST(&evpool->sockets)) != NULL) {
+		TAILQ_REMOVE(&evpool->sockets, evsocket, next);
+		evpool->socket_cnt--;
 	}
-	mutex_leave(cq->lock);
-	return item;
-}
+	EVeasy_THREAD_UNLOCK(evpool);
 
-static void
-cq_push(CQ *cq, CQ_ITEM *item)
-{
-	item->next = NULL;
-	mutex_enter(cq->lock);
-	if (NULL == cq->tail)
-		cq->head = item;
-	else
-		cq->tail->next = item;
-	cq->tail = item;
-	mutex_leave(cq->lock);
-}
+	if (NULL == evsocket) {
 
-static CQ_ITEM *
-cqi_new(void)
-{
-	CQ_ITEM *item = NULL;
-	mutex_enter(cqi_freelist_lock);
-	if (cqi_freelist) {
-		item = cqi_freelist;
-		cqi_freelist = item->next;
-	}
-	mutex_leave(cqi_freelist_lock);
-	if (NULL == item) {
-		int i;
-		/* Allocate a bunch of items at once to reduce fragmentation */
-		item = malloc(sizeof(CQ_ITEM) * ITEMS_PER_ALLOC);
-		if (NULL == item) {
-			fprintf(stderr, "Allocate a bunch of items at once to reduce fragmentation \n");
+		evsocket_per = mm_calloc(1, sizeof(struct eveasy_socket_per));
+		if (NULL == evsocket_per) {
+			event_warn("%s: calloc failed", __func__);
 			return NULL;
 		}
-		for (i = 2; i < ITEMS_PER_ALLOC; i++)
-			item[i - 1].next = &item[i];
-		mutex_enter(cqi_freelist_lock);
-		item[ITEMS_PER_ALLOC - 1].next = cqi_freelist;
-		cqi_freelist = &item[1];
-		mutex_leave(cqi_freelist_lock);
+
+		evsocket = mm_calloc(SOCKET_PER_ALLOC, sizeof(struct eveasy_socket));
+		if (NULL == evsocket) {
+			event_warn("%s: calloc failed", __func__);
+			mm_free(evsocket_per);
+			return NULL;
+		}
+
+		evsocket_per->socket = evsocket;
+		TAILQ_INSERT_TAIL(&evpool->socket_pers, evsocket_per, next);
+
+		EVeasy_THREAD_LOCK(evpool);
+		for (i = 1; i < SOCKET_PER_ALLOC; i++)
+			TAILQ_INSERT_TAIL(&evpool->sockets, &evsocket[i], next);
+		evpool->socket_cnt += (SOCKET_PER_ALLOC-1);
+		EVeasy_THREAD_UNLOCK(evpool);
 	}
-	return item;
+
+	return evsocket;
 }
 
 static void
-cqi_free(CQ_ITEM *item)
+eveasy_socket_free(
+	struct eveasy_thread_pool *evpool, struct eveasy_socket *evsocket)
 {
-	mutex_enter(cqi_freelist_lock);
-	item->next = cqi_freelist;
-	cqi_freelist = item;
-	mutex_leave(cqi_freelist_lock);
-}
-
-static void
-hexdump(const unsigned char *ptr, int len)
-{
-	int i;
-	for (i = 0; i < len; ++i)
-		printf("%02x ", ptr[i]);
-	printf("\n");
-}
-
-static void
-conn_print(struct bufferevent *bev, const char *TAG)
-{
-	struct sockaddr_storage ss;
-	evutil_socket_t fd = bufferevent_getfd(bev);
-	ev_socklen_t socklen = sizeof(ss);
-	char addrbuf[128];
-	void *inaddr;
-	const char *addr;
-	uint16_t got_port = -1;
-
-	memset(&ss, 0, sizeof(ss));
-	if (getsockname(fd, (struct sockaddr *)&ss, &socklen)) {
-		perror("getsockname() failed");
+#if 0
+	if (evpool->socket_cnt > SOCKET_PER_ALLOC * 2) {
+		mm_free(evsocket);
 		return;
 	}
+#endif
 
-	if (ss.ss_family == AF_INET) {
-		got_port = ntohs(((struct sockaddr_in *)&ss)->sin_port);
-		inaddr = &((struct sockaddr_in *)&ss)->sin_addr;
-	} else if (ss.ss_family == AF_INET6) {
-		got_port = ntohs(((struct sockaddr_in6 *)&ss)->sin6_port);
-		inaddr = &((struct sockaddr_in6 *)&ss)->sin6_addr;
-	}
+	EVeasy_THREAD_LOCK(evpool);
+	TAILQ_INSERT_TAIL(&evpool->sockets, evsocket, next);
+	evpool->socket_cnt++;
+	EVeasy_THREAD_UNLOCK(evpool);
+}
 
-	addr = evutil_inet_ntop(ss.ss_family, inaddr, addrbuf, sizeof(addrbuf));
-	if (addr) {
-		printf("%s on %s:%d\n", TAG, addr, got_port);
-	} else {
-		fprintf(stderr, "evutil_inet_ntop failed\n");
+static void 
+eveasy_socket_push(
+	struct eveasy_thread *evthread, struct eveasy_socket *evsocket)
+{
+	EVeasy_THREAD_LOCK(evthread);
+	TAILQ_INSERT_TAIL(&evthread->sockets, evsocket, next);
+	EVeasy_THREAD_UNLOCK(evthread);
+}
+
+static struct eveasy_socket *
+eveasy_socket_pop(struct eveasy_thread *evthread)
+{
+	struct eveasy_socket *evsocket;
+
+	EVeasy_THREAD_LOCK(evthread);
+	if ((evsocket = TAILQ_FIRST(&evthread->sockets)) != NULL) {
+		TAILQ_REMOVE(&evthread->sockets, evsocket, next);
 	}
+	EVeasy_THREAD_UNLOCK(evthread);
+
+	return evsocket;
 }
 
 static void
-conn_readcb(struct bufferevent *bev, void *user_data)
+thread_process(evutil_socket_t fd, short which, void *arg)
 {
-	RPC_PACKET *packet;
-	uint8_t data[1024];
-	ev_ssize_t total;
-	ev_ssize_t size;
-	struct evbuffer *body = evbuffer_new();
-	struct evbuffer *input = bufferevent_get_input(bev);
-	
-	conn_print(bev, "Reading");
-
-	while ((total = evbuffer_get_length(input)) >= sizeof(RPC_PACKET)) {
-		
-		// copy packet header
-		size = evbuffer_copyout(input, data, sizeof(RPC_PACKET));
-		if (size < sizeof(RPC_PACKET))
-			break;
-
-		packet = (RPC_PACKET *)data;
-
-		if (memcmp(packet->magic, RPC_MAGIC, sizeof(packet->magic)) != 0) {
-			evbuffer_drain(input, 1);
-#if 0
-			fprintf(stderr, "check magic: ");
-			hexdump(packet->magic, sizeof(packet->magic));
-#endif	
-			continue;
-		}
-
-		if (packet->major_version != RPC_MAJOR_VERSION ||
-			packet->minor_version != RPC_MINOR_VERSION) {
-			fprintf(stderr, "check version: %d-%d\n", packet->major_version,
-				packet->minor_version);
-			evbuffer_drain(input, sizeof(RPC_PACKET));
-			continue;
-		}
-		
-		// 不是一个完整的包
-		if (total < (ev_ssize_t)(packet->length + sizeof(RPC_PACKET))) {
-			break;
-		}
-
-		// read packet header
-		size = evbuffer_remove(input, data, sizeof(RPC_PACKET));
-		if (size > 0) {
-			
-			printf("major_version:%d, minor_version:%d, major_cmd:%d, "
-				   "minor_cmd:%d, length:%d\n",
-				packet->major_version, packet->minor_version, packet->major_cmd,
-				packet->minor_cmd, packet->length);
-
-			// read packet body
-			if (packet->length > 0) {
-				size = evbuffer_remove_buffer(input, body, packet->length);
-				if (size > 0) {
-				}
-			}
-
-			packet->state = 0;
-			packet->length = 0;
-			bufferevent_write(bev, (const void *)packet, sizeof(RPC_PACKET));
-
-			// clear packet body
-			size = evbuffer_get_length(body);
-			if (size > 0)
-				evbuffer_drain(body, size);
-		}
-	}
-
-	evbuffer_free(body);
-}
-
-static void
-conn_writecb(struct bufferevent *bev, void *user_data)
-{
-	struct evbuffer *output = bufferevent_get_output(bev);
-	if (evbuffer_get_length(output) == 0) {
-		printf("flushed answer\n");
-		// bufferevent_free(bev);
-	}
-}
-
-static void
-conn_eventcb(struct bufferevent *bev, short events, void *user_data)
-{
-	if (events & BEV_EVENT_EOF) {
-		printf("Connection closed.\n");
-	} else if (events & BEV_EVENT_ERROR) {
-		printf("Got an error on the connection: %s\n",
-			strerror(errno)); /*XXX win32*/
-	} else if (events & BEV_EVENT_TIMEOUT) {
-		printf("Connection timeout.\n");
-	}
-
-	conn_print(bev, "Close");
-
-	/* None of the other events can happen here, since we haven't enabled
-	 * timeouts */
-	bufferevent_free(bev);
-}
-
-static void
-thread_libevent_process(evutil_socket_t fd, short which, void *arg)
-{
-	LIBEVENT_THREAD *me = arg;
-
+	struct eveasy_thread *evthread = arg;
+	struct eveasy_thread_pool *evpool = evthread->pool;
+	struct event_base *base = evthread->base;
+	struct eveasy_socket *evsocket;
+	struct bufferevent *bev;
 	char buf[1];
 
 	if (recv(fd, buf, 1, 0) != 1) {
@@ -319,31 +211,24 @@ thread_libevent_process(evutil_socket_t fd, short which, void *arg)
 
 	switch (buf[0]) {
 	case 'c': {
-		struct event_base *base = me->base;
-		struct bufferevent *bev;
-		CQ_ITEM *item;
-		evutil_socket_t fd;
-
-		while ((item = cq_pop(me->new_conn_queue)) != NULL) {
+		while ((evsocket = eveasy_socket_pop(evthread)) != NULL) {
 			
-			fd = item->sfd;
-
 			// create client socket
 			bev = bufferevent_socket_new(
-				base, fd, BEV_OPT_CLOSE_ON_FREE | BEV_OPT_THREADSAFE);
+				base, evsocket->nfd, BEV_OPT_CLOSE_ON_FREE | BEV_OPT_THREADSAFE);
 			if (bev) {
-				bufferevent_setcb(
-					bev, conn_readcb, conn_writecb, conn_eventcb, NULL);
-				bufferevent_settimeout(
-					bev, CONN_TIMEOUT_READ, CONN_TIMEOUT_WRITE);
-				bufferevent_enable(bev, EV_WRITE);
-				bufferevent_enable(bev, EV_READ);
+
+				if (evpool->cb)
+					evpool->cb(bev, evpool->cbarg);
+				else
+					evutil_closesocket(fd);
+
 			} else {
 				fprintf(stderr, "Error constructing bufferevent!");
 				evutil_closesocket(fd);
 			}
 
-			cqi_free(item);
+			eveasy_socket_free(evpool, evsocket);
 		}
 	} break;
 	default:
@@ -352,156 +237,247 @@ thread_libevent_process(evutil_socket_t fd, short which, void *arg)
 }
 
 static void
-setup_thread(LIBEVENT_THREAD *me)
+eveasy_thread_loopbreak(struct eveasy_thread *evthread)
 {
-	me->base = event_init();
-	if (!me->base) {
+	if (NULL == evthread)
+		return;
+
+	if (evthread->base)
+		event_base_loopbreak(evthread->base);
+}
+
+static void
+eveasy_thread_cleanup(struct eveasy_thread *evthread)
+{
+	struct timeval msec10 = {0, 10 * 1000};
+
+	if (NULL == evthread)
+		return;
+
+	if (evthread->base)
+		event_base_loopbreak(evthread->base);
+
+	while (evthread->thread_id != 0)
+		evutil_usleep_(&msec10);
+
+	if (evthread->notify_receive_fd != EVUTIL_INVALID_SOCKET) {
+		evutil_closesocket(evthread->notify_receive_fd);
+		evthread->notify_receive_fd = EVUTIL_INVALID_SOCKET;
+	}
+
+	if (evthread->notify_send_fd != EVUTIL_INVALID_SOCKET) {
+		evutil_closesocket(evthread->notify_send_fd);
+		evthread->notify_send_fd = EVUTIL_INVALID_SOCKET;
+	}
+
+	if (evthread->notify_event) {
+		event_free(evthread->notify_event);
+		evthread->notify_event = NULL;
+	}
+
+	if (evthread->base) {
+		event_base_free(evthread->base);
+		evthread->base = NULL;
+	}
+
+	if (evthread->lock) {
+		EVTHREAD_FREE_LOCK(evthread->lock, EVTHREAD_LOCKTYPE_READWRITE);
+		evthread->lock = NULL;
+	}
+}
+
+static bool
+eveasy_thread_setup(
+	struct eveasy_thread *evthread, const struct event_config *cfg)
+{
+	evutil_socket_t fds[2];
+
+#ifdef _WIN32
+	if (evutil_socketpair(AF_INET, SOCK_STREAM, 0, fds) != 0)
+#else
+	if (evutil_socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0)
+#endif
+	{
+		fprintf(stderr, "Can't create notify socket pair\n");
+		goto error;
+	}
+
+	evutil_make_socket_nonblocking(fds[0]);
+	evutil_make_socket_nonblocking(fds[1]);
+
+	evthread->notify_receive_fd = fds[0];
+	evthread->notify_send_fd = fds[1];
+
+	evthread->base = event_base_new_with_config(cfg);
+	if (!evthread->base) {
 		fprintf(stderr, "Can't allocate event base\n");
-		exit(EXIT_FAILURE);
+		goto error;
 	}
 
 	/* Listen for notifications from other threads */
-	me->notify_event = event_new(me->base, me->notify_receive_fd,
-		EV_READ | EV_PERSIST, thread_libevent_process, me);
-	event_base_set(me->base, me->notify_event);
-	if (event_add(me->notify_event, 0) == -1) {
-		fprintf(stderr, "Can't monitor libevent notify pipe\n");
-		exit(EXIT_FAILURE);
+	evthread->notify_event =
+		event_new(evthread->base, evthread->notify_receive_fd,
+			EV_READ | EV_PERSIST, thread_process, evthread);
+	event_base_set(evthread->base, evthread->notify_event);
+	if (event_add(evthread->notify_event, 0) == -1) {
+		fprintf(stderr, "Can't monitor event notify pipe\n");
+		goto error;
 	}
 
-	me->new_conn_queue = malloc(sizeof(struct conn_queue)); 
-	if (me->new_conn_queue == NULL) {
-		perror("Failed to allocate memory for connection queue");
-		exit(EXIT_FAILURE);
-	}
-	cq_init(me->new_conn_queue);
+	TAILQ_INIT(&evthread->sockets);
+	EVTHREAD_ALLOC_LOCK(evthread->lock, EVTHREAD_LOCKTYPE_READWRITE);
+
+	return true;
+
+error:
+	eveasy_thread_cleanup(evthread);
+
+	return false;
 }
 
-#ifdef _WIN32
-static DWORD WINAPI
-worker_libevent(LPVOID arg)
-#else
 static void *
-worker_libevent(void *arg)
-#endif
+libevent_worker(void *arg)
 {
-	LIBEVENT_THREAD *me = arg;
+	struct eveasy_thread *evthread = arg;
 
-	event_base_dispatch(me->base);
+	event_base_dispatch(evthread->base);
 
-#ifdef _WIN32
-	return EXIT_SUCCESS;
-#else
+	evthread->thread_id = 0;
+
 	return NULL;
-#endif
 }
 
-#ifdef _WIN32
-static void
-create_worker(DWORD (*func)(LPVOID), void *arg)
-#else
-static void
-create_worker(void *(*func)(void *), void *arg)
-#endif
+struct eveasy_thread_pool *
+eveasy_thread_pool_new(const struct event_config *cfg, int nthreads)
 {
-	LIBEVENT_THREAD *me = arg;
+	int i;
+	struct eveasy_thread_pool *evpool = NULL;
 
-#ifdef _WIN32
-	HANDLE hThread;
-	DWORD threadid = 0;
-	hThread = CreateThread(NULL, 0, func, arg, 0, &threadid);
-	if (hThread == INVALID_HANDLE_VALUE) {
-		fprintf(stderr, "Can't create thread: %d\n", GetLastError());
-		exit(EXIT_FAILURE);
-	}
-#else
-	int ret;
-	pthread_t thread;
-	pthread_attr_t attr;
-	pthread_attr_init(&attr);
-	if ((ret = pthread_create(&thread, &attr, func, arg)) != 0) {
-		fprintf(stderr, "Can't create thread: %s\n", strerror(ret));
-		exit(EXIT_FAILURE);
-	}
-	pthread_detach(thread);
-#endif
-
-	me->thread_id = threadid;
-}
-
-int
-thread_init(unsigned int nthreads, struct event_base *main_base)
-{
-	int ret = EXIT_SUCCESS;
-	unsigned int i;
-
-	mutex_init(cqi_freelist_lock);
-	cqi_freelist = NULL;
-
-	if (nthreads == 0 || nthreads > MAX_THREAD_COUNT)
+	if (nthreads <= 0 || nthreads > MAX_THREAD_COUNT)
 		nthreads = MAX_THREAD_COUNT;
 
-	num_threads = nthreads;
+	if ((evpool = mm_calloc(1, sizeof(struct eveasy_thread_pool))) == NULL) {
+		event_warn("%s: calloc failed", __func__);
+		goto error;
+	}
 
-	threads = calloc(nthreads, sizeof(LIBEVENT_THREAD));
-	if (!threads) {
+	memset(evpool, 0, sizeof(struct eveasy_thread_pool));
+
+	evpool->thread_idx = 0;
+	evpool->thread_cnt = nthreads;
+	evpool->threads = mm_calloc(nthreads, sizeof(struct eveasy_thread));
+	if (!evpool->threads) {
 		fprintf(stderr, "Can't allocate thread descriptors\n");
-		exit(EXIT_FAILURE);
+		goto error;
 	}
 
 	for (i = 0; i < nthreads; i++) {
-		evutil_socket_t fds[2];
+		memset(&evpool->threads[i], 0, sizeof(struct eveasy_thread));
+		evpool->threads[i].notify_receive_fd = EVUTIL_INVALID_SOCKET;
+		evpool->threads[i].notify_send_fd = EVUTIL_INVALID_SOCKET;
+		evpool->threads[i].pool = evpool;
+	}
 
-#ifdef _WIN32
-		if (evutil_socketpair(AF_INET, SOCK_STREAM, 0, fds) != 0) 
-#else
-		if (evutil_socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) 
-#endif			
-		{
-			fprintf(stderr, "Can't create notify socket pair\n");
-			exit(EXIT_FAILURE);
-		}
-
-		evutil_make_socket_nonblocking(fds[0]);
-		evutil_make_socket_nonblocking(fds[1]);
-
-		threads[i].notify_receive_fd = fds[0];
-		threads[i].notify_send_fd = fds[1];
-
-		setup_thread(&threads[i]);
+	for (i = 0; i < nthreads; i++) {
+		if (!eveasy_thread_setup(&evpool->threads[i], cfg))
+			goto error;
 	}
 
 	/* Create threads after we've done all the libevent setup. */
 	for (i = 0; i < nthreads; i++) {
-		create_worker(worker_libevent, &threads[i]);
+		evpool->threads[i].thread_id =
+			sys_os_create_thread(libevent_worker, &evpool->threads[i]);
+		if (evpool->threads[i].thread_id == 0)
+			goto error;
 	}
 
-	return ret;
+	TAILQ_INIT(&evpool->socket_pers);
+	TAILQ_INIT(&evpool->sockets);
+	EVTHREAD_ALLOC_LOCK(evpool->lock, EVTHREAD_LOCKTYPE_READWRITE);
+
+	return evpool;
+
+error:
+	eveasy_thread_pool_free(evpool);
+
+	return NULL;
 }
 
 void
-dispatch_conn_new(evutil_socket_t fd)
+eveasy_thread_pool_free(struct eveasy_thread_pool *evpool)
+{
+	struct eveasy_socket_per *evsocket_per;
+	int i;
+
+	if (NULL == evpool)
+		return;
+
+	if (evpool->threads) {
+		for (i = 0; i < evpool->thread_cnt; i++) {
+			eveasy_thread_loopbreak(evpool->threads + i);
+		}
+		for (i = 0; i < evpool->thread_cnt; i++) {
+			eveasy_thread_cleanup(evpool->threads + i);
+		}
+		mm_free(evpool->threads);
+	}
+
+	while ((evsocket_per = TAILQ_FIRST(&evpool->socket_pers)) != NULL) {
+		TAILQ_REMOVE(&evpool->socket_pers, evsocket_per, next);
+		mm_free(evsocket_per->socket);
+		mm_free(evsocket_per);
+	}
+
+	if (evpool->lock) {
+		EVTHREAD_FREE_LOCK(evpool->lock, EVTHREAD_LOCKTYPE_READWRITE);
+		evpool->lock = NULL;
+	}
+
+	mm_free(evpool);
+}
+
+void
+eveasy_thread_pool_assign(struct eveasy_thread_pool *evpool,
+	evutil_socket_t nfd, struct sockaddr *addr, int addrlen)
 {
 	char buf[1];
+	struct eveasy_socket *evsocket = NULL;
+	struct eveasy_thread *evthread = NULL;
 
-	CQ_ITEM *item = cqi_new();
-	if (!item)
-	{
-		fprintf(stderr, "Failed to allocate memory for connection object\n");
-		evutil_closesocket(fd);
-		return;
+	evsocket = eveasy_socket_new(evpool);
+	if (evsocket == NULL) {
+		goto error;
 	}
 
-	item->sfd = fd;
+	evsocket->nfd = nfd;
+	evsocket->addrlen = addrlen;
+	memcpy(&evsocket->addr, addr, addrlen);
 
-	int tid = (last_thread + 1) % num_threads;
-	LIBEVENT_THREAD *thread = threads + tid;
-	last_thread = tid;
+	evthread = evpool->threads + (evpool->thread_idx % evpool->thread_cnt);
+	evpool->thread_idx++;
 
-	cq_push(thread->new_conn_queue, item);
+	eveasy_socket_push(evthread, evsocket);
 
 	buf[0] = 'c';
-	if (send(thread->notify_send_fd, buf, 1, 0) != 1) {
+	if (send(evthread->notify_send_fd, buf, 1, 0) != 1) {
 		perror("Writing to thread notify pipe");
+		goto error;
 	}
+
+	return;
+
+error:
+	evutil_closesocket(nfd);
+
+	if (evsocket)
+		eveasy_socket_free(evpool, evsocket);
+}
+
+
+void
+eveasy_thread_pool_setcb(
+	struct eveasy_thread_pool *evpool, bufferevent_socket_new_cb cb, void *arg)
+{
+	evpool->cb = cb;
+	evpool->cbarg = arg;
 }
