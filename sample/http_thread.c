@@ -18,6 +18,7 @@
 #include <stdbool.h>
 
 #define MAX_THREAD_COUNT 128
+#define SOCKET_PER_ALLOC 64
 
 /* each bound socket is stored in one of these */
 struct evhttp_socket {
@@ -35,9 +36,10 @@ struct evhttp_thread {
 	struct event *notify_event;		   /* listen event for notify pipe */
 	evutil_socket_t notify_receive_fd; /* receiving end of notify pipe */
 	evutil_socket_t notify_send_fd;	/* sending end of notify pipe */
+	struct evhttp_thread_pool *pool;
 
 	TAILQ_HEAD(evhttp_socketq, evhttp_socket)
-	sockets; /* queue of new connections to handle */
+	sockets; /* queue of new connections */
 	void *lock;
 };
 
@@ -45,22 +47,27 @@ struct evhttp_thread_pool {
 	int thread_idx;
 	int thread_cnt;
 	struct evhttp_thread *threads;
+
+	int socket_cnt;
+	TAILQ_HEAD(evhttp_socketf, evhttp_socket)
+	sockets; /* queue of free connections */
+	void *lock;
 };
 
-#define EVHTTP_THREAD_LOCK(b)              \
+#define EVHTTP_THREAD_LOCK(b)        \
 	do {                             \
 		if (b)                       \
 			EVLOCK_LOCK(b->lock, 0); \
 	} while (0)
 
-#define EVHTTP_THREAD_UNLOCK(b)              \
+#define EVHTTP_THREAD_UNLOCK(b)        \
 	do {                               \
 		if (b)                         \
 			EVLOCK_UNLOCK(b->lock, 0); \
 	} while (0)
 
 
-unsigned long
+static unsigned long
 sys_os_create_thread(void *(*func)(void *), void *arg)
 {
 #ifdef _WIN32
@@ -93,11 +100,118 @@ error:
 	return 0;
 }
 
+static struct evhttp_socket *
+evhttp_socket_new(struct evhttp_thread_pool *evpool)
+{
+	struct evhttp_socket *evsocket = NULL;
+
+	EVHTTP_THREAD_LOCK(evpool);
+	if ((evsocket = TAILQ_FIRST(&evpool->sockets)) != NULL) {
+		TAILQ_REMOVE(&evpool->sockets, evsocket, next);
+		evpool->socket_cnt--;
+	}
+	EVHTTP_THREAD_UNLOCK(evpool);
+
+	if (NULL == evsocket) {
+
+#if 1
+
+#if 1
+		evsocket = mm_calloc(1, sizeof(struct evhttp_socket));
+		if (NULL == evsocket) {
+			event_warn("%s: calloc failed", __func__);
+			return NULL;
+		}
+#else
+		int i;
+		for (i = 0; i < SOCKET_PER_ALLOC; i++)
+		{
+			evsocket = mm_calloc(1, sizeof(struct evhttp_socket));
+			if (NULL == evsocket) {
+				event_warn("%s: calloc failed", __func__);
+				break;
+			}
+
+			EVHTTP_THREAD_LOCK(evpool);
+			TAILQ_INSERT_TAIL(&evpool->sockets, evsocket, next);
+			evpool->socket_cnt++;
+			EVHTTP_THREAD_UNLOCK(evpool);
+		}
+		
+		EVHTTP_THREAD_LOCK(evpool);
+		if ((evsocket = TAILQ_FIRST(&evpool->sockets)) != NULL) {
+			TAILQ_REMOVE(&evpool->sockets, evsocket, next);
+			evpool->socket_cnt--;
+		}
+		EVHTTP_THREAD_UNLOCK(evpool);
+#endif
+
+#else
+		evsocket = mm_calloc(SOCKET_PER_ALLOC, sizeof(struct evhttp_socket));
+		if (NULL == evsocket) {
+			event_warn("%s: calloc failed", __func__);
+			return NULL;
+		}
+
+		EVHTTP_THREAD_LOCK(evpool);
+		for (i = 1; i < SOCKET_PER_ALLOC; i++)
+			TAILQ_INSERT_TAIL(&evpool->sockets, &evsocket[i], next);
+		EVHTTP_THREAD_UNLOCK(evpool);
+		return NULL;
+#endif
+	}
+
+	return evsocket;
+}
+
+static void
+evhttp_socket_free(
+	struct evhttp_thread_pool *evpool, struct evhttp_socket *evsocket)
+{
+#if 0
+	if (evpool->socket_cnt > SOCKET_PER_ALLOC * 2) {
+		mm_free(evsocket);
+		return;
+	}
+#endif
+
+	EVHTTP_THREAD_LOCK(evpool);
+	TAILQ_INSERT_TAIL(&evpool->sockets, evsocket, next);
+	evpool->socket_cnt++;
+	EVHTTP_THREAD_UNLOCK(evpool);
+}
+
+static void 
+evhttp_socket_push(
+	struct evhttp_thread *evthread, struct evhttp_socket *evsocket)
+{
+	EVHTTP_THREAD_LOCK(evthread);
+	TAILQ_INSERT_TAIL(&evthread->sockets, evsocket, next);
+	EVHTTP_THREAD_UNLOCK(evthread);
+}
+
+static struct evhttp_socket *
+evhttp_socket_pop(struct evhttp_thread *evthread)
+{
+	struct evhttp_socket *evsocket;
+
+	EVHTTP_THREAD_LOCK(evthread);
+	if ((evsocket = TAILQ_FIRST(&evthread->sockets)) != NULL) {
+		TAILQ_REMOVE(&evthread->sockets, evsocket, next);
+	}
+	EVHTTP_THREAD_UNLOCK(evthread);
+
+	return evsocket;
+}
+
+
 static void
 thread_process(evutil_socket_t fd, short which, void *arg)
 {
 	struct evhttp_thread *evthread = arg;
-
+	struct evhttp_thread_pool *evpool = evthread->pool;
+	struct evhttp *http = evthread->http;
+	struct evhttp_socket *evsocket;
 	char buf[1];
 
 	if (recv(fd, buf, 1, 0) != 1) {
@@ -107,23 +221,13 @@ thread_process(evutil_socket_t fd, short which, void *arg)
 
 	switch (buf[0]) {
 	case 'c': {
-		struct evhttp *http = evthread->http;
-		struct event_base *base = evthread->base;
-		struct evhttp_socket *evsoc;
+		while ((evsocket = evhttp_socket_pop(evthread)) != NULL) {
 
-		EVHTTP_THREAD_LOCK(evthread);
+			evhttp_get_request(
+				http, evsocket->nfd, &evsocket->addr, evsocket->addrlen, NULL);
 
-		while ((evsoc = TAILQ_FIRST(&evthread->sockets)) != NULL) {
-			
-			evhttp_get_request(http, evsoc->nfd, &evsoc->addr, evsoc->addrlen, NULL);
-
-			TAILQ_REMOVE(&evthread->sockets, evsoc, next);
-
-			mm_free(evsoc);
+			evhttp_socket_free(evpool, evsocket);
 		}
-		
-		EVHTTP_THREAD_UNLOCK(evthread);
-
 	} break;
 	default:
 		break;
@@ -133,7 +237,7 @@ thread_process(evutil_socket_t fd, short which, void *arg)
 static void
 thread_cleanup(struct evhttp_thread *evthread)
 {
-	struct evhttp_socket *evsoc;
+	struct evhttp_socket *evsocket;
 	struct timeval msec10 = {0, 10 * 1000};
 
 	if (NULL == evthread)
@@ -170,12 +274,10 @@ thread_cleanup(struct evhttp_thread *evthread)
 		evthread->base = NULL;
 	}
 
-	//EVHTTP_THREAD_LOCK(evthread);
-	while ((evsoc = TAILQ_FIRST(&evthread->sockets)) != NULL) {
-		TAILQ_REMOVE(&evthread->sockets, evsoc, next);
-		mm_free(evsoc);
+	while ((evsocket = TAILQ_FIRST(&evthread->sockets)) != NULL) {
+		TAILQ_REMOVE(&evthread->sockets, evsocket, next);
+		mm_free(evsocket);
 	}
-	//EVHTTP_THREAD_UNLOCK(evthread);
 
 	if (evthread->lock) {
 		EVTHREAD_FREE_LOCK(evthread->lock, EVTHREAD_LOCKTYPE_READWRITE);
@@ -228,7 +330,7 @@ thread_setup(struct evhttp_thread *evthread, const struct event_config *cfg)
 
 	TAILQ_INIT(&evthread->sockets);
 	EVTHREAD_ALLOC_LOCK(evthread->lock, EVTHREAD_LOCKTYPE_READWRITE);
-	
+
 	return true;
 
 error:
@@ -255,13 +357,15 @@ evhttp_thread_pool_new(const struct event_config *cfg, int nthreads)
 	int i;
 	struct evhttp_thread_pool *evpool = NULL;
 
+	if (nthreads <= 0 || nthreads > MAX_THREAD_COUNT)
+		nthreads = MAX_THREAD_COUNT;
+
 	if ((evpool = mm_calloc(1, sizeof(struct evhttp_thread_pool))) == NULL) {
 		event_warn("%s: calloc failed", __func__);
 		goto error;
 	}
 
-	if (nthreads <= 0 || nthreads > MAX_THREAD_COUNT)
-		nthreads = MAX_THREAD_COUNT;
+	memset(evpool, 0, sizeof(struct evhttp_thread_pool));
 
 	evpool->thread_idx = 0;
 	evpool->thread_cnt = nthreads;
@@ -275,6 +379,7 @@ evhttp_thread_pool_new(const struct event_config *cfg, int nthreads)
 		memset(&evpool->threads[i], 0, sizeof(struct evhttp_thread));
 		evpool->threads[i].notify_receive_fd = EVUTIL_INVALID_SOCKET;
 		evpool->threads[i].notify_send_fd = EVUTIL_INVALID_SOCKET;
+		evpool->threads[i].pool = evpool;
 	}
 
 	for (i = 0; i < nthreads; i++) {
@@ -290,6 +395,9 @@ evhttp_thread_pool_new(const struct event_config *cfg, int nthreads)
 			goto error;
 	}
 
+	TAILQ_INIT(&evpool->sockets);
+	EVTHREAD_ALLOC_LOCK(evpool->lock, EVTHREAD_LOCKTYPE_READWRITE);
+
 	return evpool;
 
 error:
@@ -301,6 +409,7 @@ error:
 void
 evhttp_thread_pool_free(struct evhttp_thread_pool *evpool)
 {
+	struct evhttp_socket *evsocket;
 	int i;
 
 	if (NULL == evpool)
@@ -313,32 +422,40 @@ evhttp_thread_pool_free(struct evhttp_thread_pool *evpool)
 		mm_free(evpool->threads);
 	}
 
+	while ((evsocket = TAILQ_FIRST(&evpool->sockets)) != NULL) {
+		TAILQ_REMOVE(&evpool->sockets, evsocket, next);
+		mm_free(evsocket);
+	}
+
+	if (evpool->lock) {
+		EVTHREAD_FREE_LOCK(evpool->lock, EVTHREAD_LOCKTYPE_READWRITE);
+		evpool->lock = NULL;
+	}
+
 	mm_free(evpool);
 }
 
 void
-evhttp_thread_pool_assign(struct evhttp_thread_pool *evpool, 
+evhttp_thread_pool_assign(struct evhttp_thread_pool *evpool,
 	evutil_socket_t nfd, struct sockaddr *addr, int addrlen)
 {
 	char buf[1];
-	struct evhttp_socket *evsoc = NULL;
+	struct evhttp_socket *evsocket = NULL;
 	struct evhttp_thread *evthread = NULL;
 
-	if ((evsoc = mm_calloc(1, sizeof(struct evhttp_socket))) == NULL) {
-		event_warn("%s: calloc failed", __func__);
+	evsocket = evhttp_socket_new(evpool);
+	if (evsocket == NULL) {
 		goto error;
 	}
 
-	evsoc->nfd = nfd;
-	evsoc->addrlen = addrlen;
-	memcpy(&evsoc->addr, addr, addrlen);
+	evsocket->nfd = nfd;
+	evsocket->addrlen = addrlen;
+	memcpy(&evsocket->addr, addr, addrlen);
 
 	evthread = evpool->threads + (evpool->thread_idx % evpool->thread_cnt);
 	evpool->thread_idx++;
 
-	EVHTTP_THREAD_LOCK(evthread);
-	TAILQ_INSERT_TAIL(&evthread->sockets, evsoc, next);
-	EVHTTP_THREAD_UNLOCK(evthread);
+	evhttp_socket_push(evthread, evsocket);
 
 	buf[0] = 'c';
 	if (send(evthread->notify_send_fd, buf, 1, 0) != 1) {
@@ -351,8 +468,8 @@ evhttp_thread_pool_assign(struct evhttp_thread_pool *evpool,
 error:
 	evutil_closesocket(nfd);
 
-	if (evsoc)
-		mm_free(evsoc);
+	if (evsocket)
+		evhttp_socket_free(evpool, evsocket);
 }
 
 int
@@ -370,7 +487,8 @@ evhttp_thread_pool_get_connection_count(struct evhttp_thread_pool *evpool)
 	return cnt;
 }
 
-int evhttp_thread_pool_get_thread_count(struct evhttp_thread_pool *evpool)
+int
+evhttp_thread_pool_get_thread_count(struct evhttp_thread_pool *evpool)
 {
 	if (evpool == NULL)
 		return 0;
@@ -378,8 +496,8 @@ int evhttp_thread_pool_get_thread_count(struct evhttp_thread_pool *evpool)
 	return evpool->thread_cnt;
 }
 
-struct evhttp *evhttp_thread_pool_get_http(
-	struct evhttp_thread_pool *evpool, int index)
+struct evhttp *
+evhttp_thread_pool_get_http(struct evhttp_thread_pool *evpool, int index)
 {
 	if (evpool == NULL)
 		return NULL;
