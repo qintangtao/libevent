@@ -8,15 +8,21 @@ extern "C" {
 #endif
 
 struct evhttp_thread_pool *evhttp_thread_pool_new(
-	struct evhttp *http, int nthreads);
+	struct evhttp *http, const struct event_config *cfg, int nthreads);
 
 void evhttp_thread_pool_free(struct evhttp_thread_pool *evpool);
 
-void evhttp_thread_dispatch_socket(
-	struct evhttp_thread_pool *evpool, evutil_socket_t nfd, struct sockaddr *addr, int addrlen);
+void evhttp_thread_pool_assign(struct evhttp_thread_pool *evpool, 
+	evutil_socket_t nfd, 
+	struct sockaddr *addr, 
+	int addrlen);
 
-int
-evhttp_thread_get_connection_count(struct evhttp_thread_pool *evpool);
+int evhttp_thread_pool_get_connection_count(struct evhttp_thread_pool *evpool);
+
+int evhttp_thread_pool_get_thread_count(struct evhttp_thread_pool *evpool);
+
+struct evhttp *evhttp_thread_pool_get_http(
+	struct evhttp_thread_pool *evpool, int index);
 
 #ifdef __cplusplus
 }

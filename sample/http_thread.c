@@ -185,7 +185,9 @@ thread_cleanup(struct evhttp_thread *evthread)
 }
 
 static 
-bool thread_setup(struct evhttp_thread *evthread, struct evhttp *http)
+bool
+thread_setup(struct evhttp_thread *evthread, struct evhttp *http,
+	const struct event_config *cfg)
 {
 	struct evhttp_cb *http_cb;
 	evutil_socket_t fds[2];
@@ -206,7 +208,7 @@ bool thread_setup(struct evhttp_thread *evthread, struct evhttp *http)
 	evthread->notify_receive_fd = fds[0];
 	evthread->notify_send_fd = fds[1];
 
-	evthread->base = event_init();
+	evthread->base = event_base_new_with_config(cfg);
 	if (!evthread->base) {
 		fprintf(stderr, "Can't allocate event base\n");
 		goto error;
@@ -264,7 +266,8 @@ http_worker(void *arg)
 }
 
 struct evhttp_thread_pool *
-evhttp_thread_pool_new(struct evhttp *http, int nthreads)
+evhttp_thread_pool_new(
+	struct evhttp *http, const struct event_config *cfg, int nthreads)
 {
 	int i;
 	struct evhttp_thread_pool *evpool = NULL;
@@ -291,7 +294,7 @@ evhttp_thread_pool_new(struct evhttp *http, int nthreads)
 	}
 
 	for (i = 0; i < nthreads; i++) {
-		if (!thread_setup(&evpool->threads[i], http))
+		if (!thread_setup(&evpool->threads[i], http, cfg))
 			goto error;
 	}
 
@@ -330,7 +333,7 @@ evhttp_thread_pool_free(struct evhttp_thread_pool *evpool)
 }
 
 void
-evhttp_thread_dispatch_socket(struct evhttp_thread_pool *evpool, 
+evhttp_thread_pool_assign(struct evhttp_thread_pool *evpool, 
 	evutil_socket_t nfd, struct sockaddr *addr, int addrlen)
 {
 	char buf[1];
@@ -369,7 +372,7 @@ error:
 }
 
 int
-evhttp_thread_get_connection_count(struct evhttp_thread_pool *evpool)
+evhttp_thread_pool_get_connection_count(struct evhttp_thread_pool *evpool)
 {
 	int i, cnt = 0;
 
@@ -381,4 +384,24 @@ evhttp_thread_get_connection_count(struct evhttp_thread_pool *evpool)
 	}
 
 	return cnt;
+}
+
+int evhttp_thread_pool_get_thread_count(struct evhttp_thread_pool *evpool)
+{
+	if (evpool == NULL)
+		return 0;
+
+	return evpool->thread_cnt;
+}
+
+struct evhttp *evhttp_thread_pool_get_http(
+	struct evhttp_thread_pool *evpool, int index)
+{
+	if (evpool == NULL)
+		return NULL;
+
+	if (index < 0 || index >= evpool->thread_cnt)
+		return NULL;
+
+	return evpool->threads[index].http;
 }

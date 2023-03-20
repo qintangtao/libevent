@@ -249,7 +249,7 @@ dump_request_cb(struct evhttp_request *req, void *arg)
 
 	if (g_pool) {
 		evbuffer_add_printf(evb, "  <p>%s: %d</p>\n", "connection count",
-			evhttp_thread_get_connection_count(g_pool));
+			evhttp_thread_pool_get_connection_count(g_pool));
 	} else {
 		evbuffer_add_printf(evb, "  <p>%s: %d</p>\n", "connection count",
 			evhttp_get_connection_count(http));
@@ -636,7 +636,7 @@ accept_socket_cb(struct evconnlistener *listener, evutil_socket_t nfd,
 #if 1
 	struct evhttp_thread_pool *pool = arg;
 
-	evhttp_thread_dispatch_socket(pool, nfd, peer_sa, peer_socklen);
+	evhttp_thread_pool_assign(pool, nfd, peer_sa, peer_socklen);
 #else
 	struct evhttp_bound_socket *bound = arg;
 
@@ -709,8 +709,8 @@ main(int argc, char **argv)
 		fprintf(stderr, "Couldn't create an event_base: exiting\n");
 		ret = 1;
 	}
-	event_config_free(cfg);
-	cfg = NULL;
+	//event_config_free(cfg);
+	//cfg = NULL;
 
 	/* Create a new evhttp object to handle requests. */
 	http = evhttp_new(base);
@@ -773,7 +773,7 @@ main(int argc, char **argv)
 	}
 
 	// create http thread pool
-	pool = evhttp_thread_pool_new(http, 128);
+	pool = evhttp_thread_pool_new(http, cfg, 128);
 	if (pool) {
 
 		g_pool = pool;
