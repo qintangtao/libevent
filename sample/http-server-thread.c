@@ -771,6 +771,23 @@ main(int argc, char **argv)
 		}
 	}
 
+#if 0
+	{
+		struct sockaddr_un addr;
+		struct timeval msec10 = {5, 0};
+
+		pool = evhttp_thread_pool_new(cfg, 128);
+
+		evhttp_thread_pool_assign(
+			pool, EVUTIL_INVALID_SOCKET, (struct sockaddr *)&addr, sizeof(addr));
+		
+		evutil_usleep_(&msec10);
+
+		evhttp_thread_pool_free(pool);
+	}
+#endif
+
+
 	// create http thread pool
 	pool = evhttp_thread_pool_new(cfg, 128);
 	if (pool) {
@@ -781,6 +798,7 @@ main(int argc, char **argv)
 		{
 			http_thread = evhttp_thread_pool_get_http(pool, i);
 			if (http_thread) {
+
 				evhttp_set_timeout(http_thread, 30);
 
 				/* The /dump URI will dump all requests to stdout and say 200

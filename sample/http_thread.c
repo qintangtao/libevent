@@ -29,6 +29,12 @@ struct evhttp_socket {
 	int addrlen;
 };
 
+struct evhttp_socket_per {
+	TAILQ_ENTRY(evhttp_socket_per) next;
+
+	struct evhttp_socket *socket;
+};
+
 struct evhttp_thread {
 	int thread_id; /* unique ID of this thread */
 	struct evhttp *http;
@@ -52,6 +58,9 @@ struct evhttp_thread_pool {
 	TAILQ_HEAD(evhttp_socketf, evhttp_socket)
 	sockets; /* queue of free connections */
 	void *lock;
+
+	TAILQ_HEAD(evhttp_socket_refq, evhttp_socket_per)
+	socket_pers; /* queue of socket pers*/
 };
 
 #define EVHTTP_THREAD_LOCK(b)        \
@@ -104,6 +113,8 @@ static struct evhttp_socket *
 evhttp_socket_new(struct evhttp_thread_pool *evpool)
 {
 	struct evhttp_socket *evsocket = NULL;
+	struct evhttp_socket_per *evsocket_per;
+	int i;
 
 	EVHTTP_THREAD_LOCK(evpool);
 	if ((evsocket = TAILQ_FIRST(&evpool->sockets)) != NULL) {
@@ -114,51 +125,27 @@ evhttp_socket_new(struct evhttp_thread_pool *evpool)
 
 	if (NULL == evsocket) {
 
-#if 1
-
-#if 1
-		evsocket = mm_calloc(1, sizeof(struct evhttp_socket));
-		if (NULL == evsocket) {
+		evsocket_per = mm_calloc(1, sizeof(struct evhttp_socket_per));
+		if (NULL == evsocket_per) {
 			event_warn("%s: calloc failed", __func__);
 			return NULL;
 		}
-#else
-		int i;
-		for (i = 0; i < SOCKET_PER_ALLOC; i++)
-		{
-			evsocket = mm_calloc(1, sizeof(struct evhttp_socket));
-			if (NULL == evsocket) {
-				event_warn("%s: calloc failed", __func__);
-				break;
-			}
 
-			EVHTTP_THREAD_LOCK(evpool);
-			TAILQ_INSERT_TAIL(&evpool->sockets, evsocket, next);
-			evpool->socket_cnt++;
-			EVHTTP_THREAD_UNLOCK(evpool);
-		}
-		
-		EVHTTP_THREAD_LOCK(evpool);
-		if ((evsocket = TAILQ_FIRST(&evpool->sockets)) != NULL) {
-			TAILQ_REMOVE(&evpool->sockets, evsocket, next);
-			evpool->socket_cnt--;
-		}
-		EVHTTP_THREAD_UNLOCK(evpool);
-#endif
-
-#else
 		evsocket = mm_calloc(SOCKET_PER_ALLOC, sizeof(struct evhttp_socket));
 		if (NULL == evsocket) {
 			event_warn("%s: calloc failed", __func__);
+			mm_free(evsocket_per);
 			return NULL;
 		}
+
+		evsocket_per->socket = evsocket;
+		TAILQ_INSERT_TAIL(&evpool->socket_pers, evsocket_per, next);
 
 		EVHTTP_THREAD_LOCK(evpool);
 		for (i = 1; i < SOCKET_PER_ALLOC; i++)
 			TAILQ_INSERT_TAIL(&evpool->sockets, &evsocket[i], next);
+		evpool->socket_cnt += (SOCKET_PER_ALLOC-1);
 		EVHTTP_THREAD_UNLOCK(evpool);
-		return NULL;
-#endif
 	}
 
 	return evsocket;
@@ -204,7 +191,6 @@ evhttp_socket_pop(struct evhttp_thread *evthread)
 	return evsocket;
 }
 
-
 static void
 thread_process(evutil_socket_t fd, short which, void *arg)
 {
@@ -235,9 +221,18 @@ thread_process(evutil_socket_t fd, short which, void *arg)
 }
 
 static void
-thread_cleanup(struct evhttp_thread *evthread)
+evhttp_thread_loopbreak(struct evhttp_thread *evthread)
 {
-	struct evhttp_socket *evsocket;
+	if (NULL == evthread)
+		return;
+
+	if (evthread->base)
+		event_base_loopbreak(evthread->base);
+}
+
+static void
+evhttp_thread_cleanup(struct evhttp_thread *evthread)
+{
 	struct timeval msec10 = {0, 10 * 1000};
 
 	if (NULL == evthread)
@@ -274,11 +269,6 @@ thread_cleanup(struct evhttp_thread *evthread)
 		evthread->base = NULL;
 	}
 
-	while ((evsocket = TAILQ_FIRST(&evthread->sockets)) != NULL) {
-		TAILQ_REMOVE(&evthread->sockets, evsocket, next);
-		mm_free(evsocket);
-	}
-
 	if (evthread->lock) {
 		EVTHREAD_FREE_LOCK(evthread->lock, EVTHREAD_LOCKTYPE_READWRITE);
 		evthread->lock = NULL;
@@ -286,7 +276,8 @@ thread_cleanup(struct evhttp_thread *evthread)
 }
 
 static bool
-thread_setup(struct evhttp_thread *evthread, const struct event_config *cfg)
+evhttp_thread_setup(
+	struct evhttp_thread *evthread, const struct event_config *cfg)
 {
 	evutil_socket_t fds[2];
 
@@ -324,7 +315,7 @@ thread_setup(struct evhttp_thread *evthread, const struct event_config *cfg)
 			EV_READ | EV_PERSIST, thread_process, evthread);
 	event_base_set(evthread->base, evthread->notify_event);
 	if (event_add(evthread->notify_event, 0) == -1) {
-		fprintf(stderr, "Can't monitor libevent notify pipe\n");
+		fprintf(stderr, "Can't monitor event notify pipe\n");
 		goto error;
 	}
 
@@ -334,7 +325,7 @@ thread_setup(struct evhttp_thread *evthread, const struct event_config *cfg)
 	return true;
 
 error:
-	thread_cleanup(evthread);
+	evhttp_thread_cleanup(evthread);
 
 	return false;
 }
@@ -383,7 +374,7 @@ evhttp_thread_pool_new(const struct event_config *cfg, int nthreads)
 	}
 
 	for (i = 0; i < nthreads; i++) {
-		if (!thread_setup(&evpool->threads[i], cfg))
+		if (!evhttp_thread_setup(&evpool->threads[i], cfg))
 			goto error;
 	}
 
@@ -395,6 +386,7 @@ evhttp_thread_pool_new(const struct event_config *cfg, int nthreads)
 			goto error;
 	}
 
+	TAILQ_INIT(&evpool->socket_pers);
 	TAILQ_INIT(&evpool->sockets);
 	EVTHREAD_ALLOC_LOCK(evpool->lock, EVTHREAD_LOCKTYPE_READWRITE);
 
@@ -409,7 +401,7 @@ error:
 void
 evhttp_thread_pool_free(struct evhttp_thread_pool *evpool)
 {
-	struct evhttp_socket *evsocket;
+	struct evhttp_socket_per *evsocket_per;
 	int i;
 
 	if (NULL == evpool)
@@ -417,14 +409,18 @@ evhttp_thread_pool_free(struct evhttp_thread_pool *evpool)
 
 	if (evpool->threads) {
 		for (i = 0; i < evpool->thread_cnt; i++) {
-			thread_cleanup(evpool->threads + i);
+			evhttp_thread_loopbreak(evpool->threads + i);
+		}
+		for (i = 0; i < evpool->thread_cnt; i++) {
+			evhttp_thread_cleanup(evpool->threads + i);
 		}
 		mm_free(evpool->threads);
 	}
 
-	while ((evsocket = TAILQ_FIRST(&evpool->sockets)) != NULL) {
-		TAILQ_REMOVE(&evpool->sockets, evsocket, next);
-		mm_free(evsocket);
+	while ((evsocket_per = TAILQ_FIRST(&evpool->socket_pers)) != NULL) {
+		TAILQ_REMOVE(&evpool->socket_pers, evsocket_per, next);
+		mm_free(evsocket_per->socket);
+		mm_free(evsocket_per);
 	}
 
 	if (evpool->lock) {
