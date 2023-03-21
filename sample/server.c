@@ -21,6 +21,7 @@
 #include <event2/bufferevent.h>
 #include <event2/bufferevent_compat.h>
 
+
 #include "thread.h"
 
 #define CONN_TIMEOUT_READ 30
@@ -207,14 +208,27 @@ conn_eventcb(struct bufferevent *bev, short events, void *user_data)
 }
 
 static void
-socket_new_cb(struct bufferevent *bev, void *arg)
+thread_pool_cb(struct eveasy_thread *evthread,
+	evutil_socket_t fd,
+	struct sockaddr *sa, int socklen, void *arg)
 {
 	struct eveasy_thread_pool *pool = arg;
+	struct event_base *base = eveasy_thread_get_base(evthread);
+	struct bufferevent *bev;
 
-	bufferevent_setcb(bev, conn_readcb, conn_writecb, conn_eventcb, NULL);
-	bufferevent_settimeout(bev, CONN_TIMEOUT_READ, CONN_TIMEOUT_WRITE);
-	//bufferevent_enable(bev, EV_WRITE);
-	bufferevent_enable(bev, EV_READ);
+	// create client socket
+	bev = bufferevent_socket_new(base, fd, BEV_OPT_CLOSE_ON_FREE | BEV_OPT_THREADSAFE);
+	if (bev) {
+
+		bufferevent_setcb(bev, conn_readcb, conn_writecb, conn_eventcb, NULL);
+		bufferevent_settimeout(bev, CONN_TIMEOUT_READ, CONN_TIMEOUT_WRITE);
+		// bufferevent_enable(bev, EV_WRITE);
+		bufferevent_enable(bev, EV_READ);
+
+	} else {
+		fprintf(stderr, "Error constructing bufferevent!");
+		evutil_closesocket(fd);
+	}
 }
 
 int
@@ -270,7 +284,7 @@ server_start(unsigned short port)
 		goto err;
 	}
 
-	eveasy_thread_pool_setcb(pool, socket_new_cb, pool);
+	eveasy_thread_pool_set_conncb(pool, thread_pool_cb, pool);
 
 	event_config_free(cfg);
 	cfg = NULL;

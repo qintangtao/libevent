@@ -8,7 +8,6 @@
 #include <event2/keyvalq_struct.h>
 #include <event2/thread.h>
 #include <event2/event_compat.h>
-#include <event2/bufferevent.h>
 
 #include "../evthread-internal.h"
 #include "../mm-internal.h"
@@ -54,8 +53,8 @@ struct eveasy_thread_pool {
 	int thread_cnt;
 	struct eveasy_thread *threads;
 
-	bufferevent_socket_new_cb cb;
-	void *cbarg;
+	eveasyconn_cb conn_cb;
+	void *conn_cbarg;
 
 	int socket_cnt;
 	TAILQ_HEAD(eveasy_socketf, eveasy_socket)
@@ -199,9 +198,7 @@ thread_process(evutil_socket_t fd, short which, void *arg)
 {
 	struct eveasy_thread *evthread = arg;
 	struct eveasy_thread_pool *evpool = evthread->pool;
-	struct event_base *base = evthread->base;
 	struct eveasy_socket *evsocket;
-	struct bufferevent *bev;
 	char buf[1];
 
 	if (recv(fd, buf, 1, 0) != 1) {
@@ -213,20 +210,11 @@ thread_process(evutil_socket_t fd, short which, void *arg)
 	case 'c': {
 		while ((evsocket = eveasy_socket_pop(evthread)) != NULL) {
 			
-			// create client socket
-			bev = bufferevent_socket_new(
-				base, evsocket->nfd, BEV_OPT_CLOSE_ON_FREE | BEV_OPT_THREADSAFE);
-			if (bev) {
-
-				if (evpool->cb)
-					evpool->cb(bev, evpool->cbarg);
-				else
-					evutil_closesocket(fd);
-
-			} else {
-				fprintf(stderr, "Error constructing bufferevent!");
+			if (evpool->conn_cb)
+				evpool->conn_cb(evthread, evsocket->nfd, &evsocket->addr,
+					evsocket->addrlen, evpool->conn_cbarg);
+			else
 				evutil_closesocket(fd);
-			}
 
 			eveasy_socket_free(evpool, evsocket);
 		}
@@ -473,11 +461,15 @@ error:
 		eveasy_socket_free(evpool, evsocket);
 }
 
-
 void
-eveasy_thread_pool_setcb(
-	struct eveasy_thread_pool *evpool, bufferevent_socket_new_cb cb, void *arg)
+eveasy_thread_pool_set_conncb(
+	struct eveasy_thread_pool *evpool, eveasyconn_cb cb, void *arg)
 {
-	evpool->cb = cb;
-	evpool->cbarg = arg;
+	evpool->conn_cb = cb;
+	evpool->conn_cbarg = arg;
+}
+
+struct event_base *eveasy_thread_get_base(struct eveasy_thread *evthread)
+{
+	return evthread->base;
 }
