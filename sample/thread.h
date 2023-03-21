@@ -22,6 +22,8 @@ void eveasy_thread_pool_assign(struct eveasy_thread_pool *evpool,
 void eveasy_thread_pool_set_conncb(
 	struct eveasy_thread_pool *evpool, eveasyconn_cb cb, void *arg);
 
+struct eveasy_thread *eveasy_thread_pool_get_thread(struct eveasy_thread_pool *evpool, int index);
+
 struct event_base *eveasy_thread_get_base(struct eveasy_thread *evthread);
 
 

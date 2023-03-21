@@ -469,7 +469,20 @@ eveasy_thread_pool_set_conncb(
 	evpool->conn_cbarg = arg;
 }
 
-struct event_base *eveasy_thread_get_base(struct eveasy_thread *evthread)
+struct eveasy_thread *
+eveasy_thread_pool_get_thread(struct eveasy_thread_pool *evpool, int index)
+{
+	if (NULL == evpool)
+		return NULL;
+
+	if (index < 0 || index >= evpool->thread_cnt)
+		return NULL;
+
+	return (evpool->threads + index);
+}
+
+struct event_base *
+eveasy_thread_get_base(struct eveasy_thread *evthread)
 {
 	return evthread->base;
 }
