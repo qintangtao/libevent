@@ -208,9 +208,8 @@ conn_eventcb(struct bufferevent *bev, short events, void *user_data)
 }
 
 static void
-thread_pool_cb(struct eveasy_thread *evthread,
-	evutil_socket_t fd,
-	struct sockaddr *sa, int socklen, void *arg)
+new_conn_cb(struct eveasy_thread *evthread,
+	evutil_socket_t fd, struct sockaddr *sa, int socklen, void *arg)
 {
 	struct eveasy_thread_pool *pool = arg;
 	struct event_base *base = eveasy_thread_get_base(evthread);
@@ -284,7 +283,7 @@ server_start(unsigned short port)
 		goto err;
 	}
 
-	eveasy_thread_pool_set_conncb(pool, thread_pool_cb, pool);
+	eveasy_thread_pool_set_conncb(pool, new_conn_cb, pool);
 
 	event_config_free(cfg);
 	cfg = NULL;
@@ -304,7 +303,6 @@ server_start(unsigned short port)
 		fprintf(stderr, "Could not create/add a signal event!\n");
 		goto err;
 	}
-
 
 	event_base_dispatch(base);
 
