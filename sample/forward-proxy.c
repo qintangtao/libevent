@@ -32,10 +32,6 @@
 #include <event2/util.h>
 
 #include "util-internal.h"
-#include <openssl/ssl.h>
-#include <openssl/err.h>
-#include <openssl/rand.h>
-#include "openssl-compat.h"
 
 static struct event_base *base;
 static struct sockaddr_storage listen_on_addr;
@@ -43,7 +39,6 @@ static struct sockaddr_storage connect_to_addr;
 static int connect_to_addrlen;
 static int use_wrapper = 1;
 
-static SSL_CTX *ssl_ctx = NULL;
 
 #define MAX_OUTPUT (512*1024)
 
@@ -107,6 +102,8 @@ eventcb(struct bufferevent *bev, short what, void *ctx)
 
 	if (what & (BEV_EVENT_EOF|BEV_EVENT_ERROR)) {
 		if (what & BEV_EVENT_ERROR) {
+
+#if 0
 			unsigned long err;
 			while ((err = (bufferevent_get_openssl_error(bev)))) {
 				const char *msg = (const char*)
@@ -125,6 +122,7 @@ eventcb(struct bufferevent *bev, short what, void *ctx)
 			}
 			if (errno)
 				perror("connection error");
+#endif
 		}
 
 		if (partner) {
@@ -154,9 +152,9 @@ static void
 syntax(void)
 {
 	fputs("Syntax:\n", stderr);
-	fputs("   le-proxy [-s] [-W] <listen-on-addr> <connect-to-addr>\n", stderr);
+	fputs("   forward-proxy <listen-on-addr> <connect-to-addr>\n", stderr);
 	fputs("Example:\n", stderr);
-	fputs("   le-proxy 127.0.0.1:8888 1.2.3.4:80\n", stderr);
+	fputs("   forward-proxy 127.0.0.1:8888 1.2.3.4:80\n", stderr);
 
 	exit(1);
 }
@@ -171,16 +169,9 @@ accept_cb(struct evconnlistener *listener, evutil_socket_t fd,
 	b_in = bufferevent_socket_new(base, fd,
 	    BEV_OPT_CLOSE_ON_FREE|BEV_OPT_DEFER_CALLBACKS);
 
-	if (!ssl_ctx || use_wrapper)
-		b_out = bufferevent_socket_new(base, -1,
-		    BEV_OPT_CLOSE_ON_FREE|BEV_OPT_DEFER_CALLBACKS);
-	else {
-		SSL *ssl = SSL_new(ssl_ctx);
-		b_out = bufferevent_openssl_socket_new(base, -1, ssl,
-		    BUFFEREVENT_SSL_CONNECTING,
-		    BEV_OPT_CLOSE_ON_FREE|BEV_OPT_DEFER_CALLBACKS);
-	}
-
+	b_out = bufferevent_socket_new(
+		base, -1, BEV_OPT_CLOSE_ON_FREE | BEV_OPT_DEFER_CALLBACKS);
+	
 	assert(b_in && b_out);
 
 	if (bufferevent_socket_connect(b_out,
@@ -189,21 +180,6 @@ accept_cb(struct evconnlistener *listener, evutil_socket_t fd,
 		bufferevent_free(b_out);
 		bufferevent_free(b_in);
 		return;
-	}
-
-	if (ssl_ctx && use_wrapper) {
-		struct bufferevent *b_ssl;
-		SSL *ssl = SSL_new(ssl_ctx);
-		b_ssl = bufferevent_openssl_filter_new(base,
-		    b_out, ssl, BUFFEREVENT_SSL_CONNECTING,
-		    BEV_OPT_CLOSE_ON_FREE|BEV_OPT_DEFER_CALLBACKS);
-		if (!b_ssl) {
-			perror("Bufferevent_openssl_new");
-			bufferevent_free(b_out);
-			bufferevent_free(b_in);
-			return;
-		}
-		b_out = b_ssl;
 	}
 
 	bufferevent_setcb(b_in, readcb, NULL, eventcb, b_out);
@@ -253,6 +229,7 @@ main(int argc, char **argv)
 	if (i+2 != argc)
 		syntax();
 
+
 	memset(&listen_on_addr, 0, sizeof(listen_on_addr));
 	socklen = sizeof(listen_on_addr);
 	if (evutil_parse_sockaddr_port(argv[i],
@@ -277,23 +254,6 @@ main(int argc, char **argv)
 	if (!base) {
 		perror("event_base_new()");
 		return 1;
-	}
-
-	if (use_ssl) {
-		int r;
-#if (OPENSSL_VERSION_NUMBER < 0x10100000L) || \
-	(defined(LIBRESSL_VERSION_NUMBER) && LIBRESSL_VERSION_NUMBER < 0x20700000L)
-		SSL_library_init();
-		ERR_load_crypto_strings();
-		SSL_load_error_strings();
-		OpenSSL_add_all_algorithms();
-#endif
-		r = RAND_poll();
-		if (r == 0) {
-			fprintf(stderr, "RAND_poll() failed.\n");
-			return 1;
-		}
-		ssl_ctx = SSL_CTX_new(TLS_method());
 	}
 
 	listener = evconnlistener_new_bind(base, accept_cb, NULL,
