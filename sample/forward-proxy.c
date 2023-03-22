@@ -31,9 +31,11 @@
 #include <event2/listener.h>
 #include <event2/util.h>
 
+#include "evthread-internal.h"
 #include "util-internal.h"
-#include "../mm-internal.h"
-#include "../compat/sys/queue.h"
+#include "mm-internal.h"
+#include "compat/sys/queue.h"
+#include "easy_thread.h"
 
 #define MAX_OUTPUT (512*1024)
 
@@ -43,6 +45,19 @@ struct bufferevent_connection {
 	struct bufferevent *bev;
 };
 TAILQ_HEAD(bufferevent_connectionq, bufferevent_connection) connections; /* queue of new connections */
+void *connection_lock = NULL;
+
+#define BEV_CONNECT_LOCK()        \
+	do {                             \
+		if (connection_lock)                       \
+			EVLOCK_LOCK(connection_lock, 0); \
+	} while (0)
+
+#define BEV_CONNECT_UNLOCK()        \
+	do {                               \
+		if (connection_lock)                         \
+			EVLOCK_UNLOCK(connection_lock, 0); \
+	} while (0)
 
 static void
 readcb(struct bufferevent *bev, void *ctx)
@@ -54,10 +69,12 @@ readcb(struct bufferevent *bev, void *ctx)
 	src = bufferevent_get_input(bev);
 	len = evbuffer_get_length(src);
 
+	BEV_CONNECT_LOCK();
 	TAILQ_FOREACH (bev_conn, &connections, next) {
 		dst = bufferevent_get_output(bev_conn->bev);
 		evbuffer_add_buffer_reference(dst, src);
 	}
+	BEV_CONNECT_UNLOCK();
 
 	evbuffer_drain(src, len);
 }
@@ -79,6 +96,7 @@ eventcb(struct bufferevent *bev, short events, void *ctx)
 		return;
 	}
 
+	BEV_CONNECT_LOCK();
 	if (bev == b_out) {
 		// close all clients;
 		while ((bev_conn = TAILQ_FIRST(&connections)) != NULL) {
@@ -97,36 +115,54 @@ eventcb(struct bufferevent *bev, short events, void *ctx)
 			}
 		}
 	}
+	BEV_CONNECT_UNLOCK();
 
 	bufferevent_free(bev);
 }
 
 static void
-accept_cb(struct evconnlistener *listener, evutil_socket_t fd,
-    struct sockaddr *a, int slen, void *p)
+accept_socket_cb(struct evconnlistener *listener, evutil_socket_t fd,
+	struct sockaddr *sa, int socklen, void *arg)
 {
-	struct event_base *base = p; 
-	struct bufferevent *b_in;
-	
-	b_in = bufferevent_socket_new(base, fd,
-	    BEV_OPT_CLOSE_ON_FREE|BEV_OPT_DEFER_CALLBACKS);
-	if (!b_in) {
-		evutil_closesocket(fd);
-		return;
-	}
+	struct eveasy_thread_pool *pool = arg;
+	eveasy_thread_pool_assign(pool, fd, sa, socklen);
+}
 
-	bufferevent_setcb(b_in, NULL, NULL, eventcb, NULL);
-	bufferevent_enable(b_in, EV_READ);
+static void
+new_conn_cb(struct eveasy_thread *evthread, evutil_socket_t fd,
+	struct sockaddr *sa, int socklen, void *arg)
+{
+	struct eveasy_thread_pool *pool = arg;
+	struct event_base *base = eveasy_thread_get_base(evthread);
+	struct bufferevent_connection *bev_conn = NULL;
 
-	struct bufferevent_connection *bev_conn = mm_calloc(1, sizeof(struct bufferevent_connection));
+	bev_conn = mm_calloc(1, sizeof(struct bufferevent_connection));
 	if (!bev_conn) {
 		event_warn("%s: calloc failed", __func__);
-		bufferevent_free(b_in);
-		return;
+		goto err;
 	}
 
-	bev_conn->bev = b_in;
+	bev_conn->bev = bufferevent_socket_new(base, fd,
+		BEV_OPT_CLOSE_ON_FREE | BEV_OPT_DEFER_CALLBACKS | BEV_OPT_THREADSAFE);
+	if (!bev_conn->bev) {
+		event_warn("%s: bufferevent socket new failed", __func__);
+		goto err;
+	}
+
+	bufferevent_setcb(bev_conn->bev, NULL, NULL, eventcb, NULL);
+	bufferevent_enable(bev_conn->bev, EV_READ);
+
+	BEV_CONNECT_LOCK();
 	TAILQ_INSERT_TAIL(&connections, bev_conn, next);
+	BEV_CONNECT_UNLOCK();
+
+	return;
+
+err:
+	if (bev_conn)
+		mm_free(bev_conn);
+
+	evutil_closesocket(fd);
 }
 
 static void
@@ -143,12 +179,15 @@ syntax(void)
 int
 main(int argc, char **argv)
 {
-	struct event_base *base = NULL;
-	struct bufferevent *b_out = NULL;
-	struct evconnlistener *listener = NULL;
+	struct eveasy_thread_pool *pool		= NULL;
+	struct event_config *cfg			= NULL;
+	struct event_base *base				= NULL;
+	struct bufferevent *bev				= NULL;
+	struct evconnlistener *listener		= NULL;
 	struct sockaddr_storage listen_on_addr;
 	struct sockaddr_storage connect_to_addr;
 	int socklen, connect_to_addrlen, i;
+	int ret = EXIT_FAILURE;
 
 #ifdef _WIN32
 	{
@@ -202,49 +241,87 @@ main(int argc, char **argv)
 		syntax();
 
 	TAILQ_INIT(&connections);
+	EVTHREAD_ALLOC_LOCK(connection_lock, EVTHREAD_LOCKTYPE_READWRITE);
 
-	base = event_base_new();
+	cfg = event_config_new();
+	if (!cfg) {
+		fprintf(stderr, "Couldn't create an config: exiting\n");
+		goto err;
+	}
+
+#ifdef _WIN32
+	SYSTEM_INFO si;
+	GetSystemInfo(&si);
+#ifdef EVTHREAD_USE_WINDOWS_THREADS_IMPLEMENTED
+	evthread_use_windows_threads();
+	event_config_set_num_cpus_hint(cfg, si.dwNumberOfProcessors);
+#endif
+	event_config_set_flag(cfg, EVENT_BASE_FLAG_STARTUP_IOCP);
+#else
+#ifdef EVTHREAD_USE_PTHREADS_IMPLEMENTED
+	evthread_use_pthreads();
+#endif
+#endif
+
+	base = event_base_new_with_config(cfg);
 	if (!base) {
-		perror("event_base_new()");
-		return 1;
+		fprintf(stderr, "Couldn't create an event_base: exiting\n");
+		goto err;
 	}
 
-	b_out = bufferevent_socket_new(
-		base, -1, BEV_OPT_CLOSE_ON_FREE | BEV_OPT_DEFER_CALLBACKS);
-	if (!b_out) {
+	pool = eveasy_thread_pool_new(cfg, 128);
+	if (!pool) {
+		fprintf(stderr, "Couldn't create an eveasy_thread_pool: exiting\n");
+		goto err;
+	}
+
+	eveasy_thread_pool_set_conncb(pool, new_conn_cb, pool);
+
+	event_config_free(cfg);
+	cfg = NULL;
+
+	bev = bufferevent_socket_new(base, -1,
+		BEV_OPT_CLOSE_ON_FREE | BEV_OPT_DEFER_CALLBACKS | BEV_OPT_THREADSAFE);
+	if (!bev) {
 		fprintf(stderr, "Couldn't open listener.\n");
-		event_base_free(base);
-		return EXIT_FAILURE;
+		goto err;
 	}
-	if (bufferevent_socket_connect(b_out, (struct sockaddr *)&connect_to_addr,
-			connect_to_addrlen) < 0) {
+	if (bufferevent_socket_connect(
+			bev, (struct sockaddr *)&connect_to_addr, connect_to_addrlen) < 0) {
 		perror("bufferevent_socket_connect");
-		bufferevent_free(b_out);
-		event_base_free(base);
-		return EXIT_FAILURE;
+		goto err;
 	}
 
-	bufferevent_setcb(b_out, readcb, NULL, eventcb, b_out);
-	bufferevent_enable(b_out, EV_READ);
+	bufferevent_setcb(bev, readcb, NULL, eventcb, bev);
+	bufferevent_enable(bev, EV_READ);
 
-	listener = evconnlistener_new_bind(base, accept_cb, base,
+	listener = evconnlistener_new_bind(base, accept_socket_cb, pool,
 	    LEV_OPT_CLOSE_ON_FREE|LEV_OPT_CLOSE_ON_EXEC|LEV_OPT_REUSEABLE,
 	    -1, (struct sockaddr*)&listen_on_addr, socklen);
 	if (! listener) {
 		fprintf(stderr, "Couldn't open listener.\n");
-		bufferevent_free(b_out);
-		event_base_free(base);
-		return EXIT_FAILURE;
+		goto err;
 	}
 
 	event_base_dispatch(base);
 
-	evconnlistener_free(listener);
-	event_base_free(base);
+	ret = EXIT_SUCCESS;
+
+err:
+	if (bev)
+		bufferevent_free(bev);
+	if (pool)
+		eveasy_thread_pool_free(pool);
+	if (cfg)
+		event_config_free(cfg);
+	if (listener)
+		evconnlistener_free(listener);
+	if (base)
+		event_base_free(base);
 
 #ifdef _WIN32
 	WSACleanup();
 #endif
 
-	return EXIT_SUCCESS;
+	return ret;
 }
