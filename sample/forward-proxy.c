@@ -37,8 +37,7 @@
 #include "compat/sys/queue.h"
 #include "easy_thread.h"
 
-
-#define USE_THREAD_POOL
+static int use_thread_pool = 0;
 
 struct bufferevent_connection {
 	TAILQ_ENTRY(bufferevent_connection) next;
@@ -46,29 +45,21 @@ struct bufferevent_connection {
 	struct event_base *base;
 	struct bufferevent *bev;
 };
-TAILQ_HEAD(bufferevent_connectionq, bufferevent_connection) connections; /* queue of new connections */
+TAILQ_HEAD(bufferevent_connectionq, bufferevent_connection)
+connections; /* queue of new connections */
 void *connection_lock = NULL;
 
-#ifdef USE_THREAD_POOL
-
-#define BEV_CONNECT_LOCK()        \
-	do {                             \
-		if (connection_lock)                       \
+#define BEV_CONNECT_LOCK()                   \
+	do {                                     \
+		if (connection_lock)                 \
 			EVLOCK_LOCK(connection_lock, 0); \
 	} while (0)
 
-#define BEV_CONNECT_UNLOCK()        \
-	do {                               \
-		if (connection_lock)                         \
+#define BEV_CONNECT_UNLOCK()                   \
+	do {                                       \
+		if (connection_lock)                   \
 			EVLOCK_UNLOCK(connection_lock, 0); \
 	} while (0)
-
-#else
-
-#define BEV_CONNECT_LOCK()
-#define BEV_CONNECT_UNLOCK()
-
-#endif
 
 static void
 readcb(struct bufferevent *bev, void *ctx)
@@ -89,7 +80,6 @@ readcb(struct bufferevent *bev, void *ctx)
 
 	evbuffer_drain(src, len);
 }
-
 
 static void
 eventcb(struct bufferevent *bev, short events, void *ctx)
@@ -120,7 +110,7 @@ eventcb(struct bufferevent *bev, short events, void *ctx)
 		// remove client from queue
 		TAILQ_FOREACH (bev_conn, &connections, next) {
 			if (bev_conn->bev == bev) {
-				//bufferevent_free(bev_conn->bev);
+				// bufferevent_free(bev_conn->bev);
 				TAILQ_REMOVE(&connections, bev_conn, next);
 				mm_free(bev_conn);
 				break;
@@ -152,7 +142,7 @@ bufferevent_connection_add(struct event_base *base, evutil_socket_t fd)
 	}
 
 	bufferevent_setcb(bev_conn->bev, NULL, NULL, eventcb, NULL);
-	//bufferevent_settimeout(bev_conn->bev, 0, 0);
+	// bufferevent_settimeout(bev_conn->bev, 0, 0);
 	bufferevent_enable(bev_conn->bev, EV_READ);
 
 	BEV_CONNECT_LOCK();
@@ -172,15 +162,15 @@ static void
 accept_socket_cb(struct evconnlistener *listener, evutil_socket_t fd,
 	struct sockaddr *sa, int socklen, void *arg)
 {
-#ifdef USE_THREAD_POOL
-	struct eveasy_thread_pool *pool = arg;
-	eveasy_thread_pool_assign(pool, fd, sa, socklen);
-#else
-	struct event_base *base = arg;
-	
-	if (!bufferevent_connection_add(base, fd))
-		evutil_closesocket(fd);
-#endif
+	if (use_thread_pool) {
+		struct eveasy_thread_pool *pool = arg;
+		eveasy_thread_pool_assign(pool, fd, sa, socklen);
+	} else	{
+		struct event_base *base = arg;
+
+		if (!bufferevent_connection_add(base, fd))
+			evutil_closesocket(fd);
+	}
 }
 
 static void
@@ -189,7 +179,7 @@ new_conn_cb(struct eveasy_thread *evthread, evutil_socket_t fd,
 {
 	struct eveasy_thread_pool *pool = arg;
 	struct event_base *base = eveasy_thread_get_base(evthread);
-	
+
 	if (!bufferevent_connection_add(base, fd))
 		evutil_closesocket(fd);
 }
@@ -198,7 +188,7 @@ static void
 syntax(void)
 {
 	fputs("Syntax:\n", stderr);
-	fputs("   forward-proxy <listen-on-addr> <connect-to-addr>\n", stderr);
+	fputs("   forward-proxy [-t] <listen-on-addr> <connect-to-addr>\n", stderr);
 	fputs("Example:\n", stderr);
 	fputs("   forward-proxy 127.0.0.1:8888 1.2.3.4:80\n", stderr);
 
@@ -208,11 +198,11 @@ syntax(void)
 int
 main(int argc, char **argv)
 {
-	struct eveasy_thread_pool *pool		= NULL;
-	struct event_config *cfg			= NULL;
-	struct event_base *base				= NULL;
-	struct bufferevent *bev				= NULL;
-	struct evconnlistener *listener		= NULL;
+	struct eveasy_thread_pool *pool = NULL;
+	struct event_config *cfg = NULL;
+	struct event_base *base = NULL;
+	struct bufferevent *bev = NULL;
+	struct evconnlistener *listener = NULL;
 	struct sockaddr_storage listen_on_addr;
 	struct sockaddr_storage connect_to_addr;
 	int socklen, connect_to_addrlen, i;
@@ -223,7 +213,7 @@ main(int argc, char **argv)
 		WORD wVersionRequested;
 		WSADATA wsaData;
 		wVersionRequested = MAKEWORD(2, 2);
-		(void) WSAStartup(wVersionRequested, &wsaData);
+		(void)WSAStartup(wVersionRequested, &wsaData);
 	}
 #else
 	if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
@@ -235,26 +225,26 @@ main(int argc, char **argv)
 	if (argc < 3)
 		syntax();
 
-	for (i=1; i < argc; ++i) {
-		if (!strcmp(argv[i], "-s")) {
-			//use_ssl = 1;
+	for (i = 1; i < argc; ++i) {
+		if (!strcmp(argv[i], "-t")) {
+			use_thread_pool = 1;
 		} else if (!strcmp(argv[i], "-W")) {
-			//use_wrapper = 0;
+			// use_wrapper = 0;
 		} else if (argv[i][0] == '-') {
 			syntax();
 		} else
 			break;
 	}
 
-	if (i+2 != argc)
+	if (i + 2 != argc)
 		syntax();
 
 	memset(&listen_on_addr, 0, sizeof(listen_on_addr));
 	socklen = sizeof(listen_on_addr);
-	if (evutil_parse_sockaddr_port(argv[i],
-		(struct sockaddr*)&listen_on_addr, &socklen)<0) {
+	if (evutil_parse_sockaddr_port(
+			argv[i], (struct sockaddr *)&listen_on_addr, &socklen) < 0) {
 		int p = atoi(argv[i]);
-		struct sockaddr_in *sin = (struct sockaddr_in*)&listen_on_addr;
+		struct sockaddr_in *sin = (struct sockaddr_in *)&listen_on_addr;
 		if (p < 1 || p > 65535)
 			syntax();
 		sin->sin_port = htons(p);
@@ -265,14 +255,13 @@ main(int argc, char **argv)
 
 	memset(&connect_to_addr, 0, sizeof(connect_to_addr));
 	connect_to_addrlen = sizeof(connect_to_addr);
-	if (evutil_parse_sockaddr_port(argv[i+1],
-		(struct sockaddr*)&connect_to_addr, &connect_to_addrlen)<0)
+	if (evutil_parse_sockaddr_port(argv[i + 1],
+			(struct sockaddr *)&connect_to_addr, &connect_to_addrlen) < 0)
 		syntax();
 
 	TAILQ_INIT(&connections);
-#ifdef USE_THREAD_POOL
-	EVTHREAD_ALLOC_LOCK(connection_lock, EVTHREAD_LOCKTYPE_READWRITE);
-#endif
+	if (use_thread_pool)
+		EVTHREAD_ALLOC_LOCK(connection_lock, EVTHREAD_LOCKTYPE_READWRITE);
 
 	cfg = event_config_new();
 	if (!cfg) {
@@ -300,16 +289,15 @@ main(int argc, char **argv)
 		goto err;
 	}
 
-#ifdef USE_THREAD_POOL
-	pool = eveasy_thread_pool_new(cfg, 128);
-	if (!pool) {
-		fprintf(stderr, "Couldn't create an eveasy_thread_pool: exiting\n");
-		goto err;
+	if (use_thread_pool) {
+		pool = eveasy_thread_pool_new(cfg, 128);
+		if (!pool) {
+			fprintf(stderr, "Couldn't create an eveasy_thread_pool: exiting\n");
+			goto err;
+		}
+
+		eveasy_thread_pool_set_conncb(pool, new_conn_cb, pool);
 	}
-
-	eveasy_thread_pool_set_conncb(pool, new_conn_cb, pool);
-
-#endif // USE_THREAD_POOL
 
 	event_config_free(cfg);
 	cfg = NULL;
@@ -329,16 +317,17 @@ main(int argc, char **argv)
 	bufferevent_setcb(bev, readcb, NULL, eventcb, bev);
 	bufferevent_enable(bev, EV_READ);
 
+	if (use_thread_pool) {
+		listener = evconnlistener_new_bind(base, accept_socket_cb, pool,
+			LEV_OPT_CLOSE_ON_FREE | LEV_OPT_CLOSE_ON_EXEC | LEV_OPT_REUSEABLE,
+			-1, (struct sockaddr *)&listen_on_addr, socklen);
+	} else {
+		listener = evconnlistener_new_bind(base, accept_socket_cb, base,
+			LEV_OPT_CLOSE_ON_FREE | LEV_OPT_CLOSE_ON_EXEC | LEV_OPT_REUSEABLE,
+			-1, (struct sockaddr *)&listen_on_addr, socklen);
+	}
 
-	listener = evconnlistener_new_bind(base, accept_socket_cb, 
-#ifdef USE_THREAD_POOL
-		pool,
-#else
-		base,
-#endif
-	    LEV_OPT_CLOSE_ON_FREE|LEV_OPT_CLOSE_ON_EXEC|LEV_OPT_REUSEABLE,
-	    -1, (struct sockaddr*)&listen_on_addr, socklen);
-	if (! listener) {
+	if (!listener) {
 		fprintf(stderr, "Couldn't open listener.\n");
 		goto err;
 	}
