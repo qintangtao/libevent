@@ -199,6 +199,8 @@ conn_eventcb(struct bufferevent *bev, short events, void *user_data)
 			strerror(errno)); /*XXX win32*/
 	} else if (events & BEV_EVENT_TIMEOUT) {
 		printf("Connection timeout.\n");
+	} else {
+		return;
 	}
 
 	conn_print(bev, "Close");
@@ -240,7 +242,7 @@ main(int argc, char **argv)
 	struct evconnlistener *listener = NULL;
 	struct event *signal_event		= NULL;
 	struct sockaddr_in sin			= {0};
-	unsigned short 					port = 9995;
+	unsigned short port				= 9995;
 	int ret							= EXIT_FAILURE;
 
 #ifdef _WIN32

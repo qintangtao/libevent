@@ -65,13 +65,13 @@ struct eveasy_thread_pool {
 	socket_pers; /* queue of socket pers*/
 };
 
-#define EVeasy_THREAD_LOCK(b)        \
+#define EVEASY_THREAD_LOCK(b)        \
 	do {                             \
 		if (b)                       \
 			EVLOCK_LOCK(b->lock, 0); \
 	} while (0)
 
-#define EVeasy_THREAD_UNLOCK(b)        \
+#define EVEASY_THREAD_UNLOCK(b)        \
 	do {                               \
 		if (b)                         \
 			EVLOCK_UNLOCK(b->lock, 0); \
@@ -118,12 +118,12 @@ eveasy_socket_new(struct eveasy_thread_pool *evpool)
 	struct eveasy_socket_per *evsocket_per;
 	int i;
 
-	EVeasy_THREAD_LOCK(evpool);
+	EVEASY_THREAD_LOCK(evpool);
 	if ((evsocket = TAILQ_FIRST(&evpool->sockets)) != NULL) {
 		TAILQ_REMOVE(&evpool->sockets, evsocket, next);
 		evpool->socket_cnt--;
 	}
-	EVeasy_THREAD_UNLOCK(evpool);
+	EVEASY_THREAD_UNLOCK(evpool);
 
 	if (NULL == evsocket) {
 
@@ -143,11 +143,11 @@ eveasy_socket_new(struct eveasy_thread_pool *evpool)
 		evsocket_per->socket = evsocket;
 		TAILQ_INSERT_TAIL(&evpool->socket_pers, evsocket_per, next);
 
-		EVeasy_THREAD_LOCK(evpool);
+		EVEASY_THREAD_LOCK(evpool);
 		for (i = 1; i < SOCKET_PER_ALLOC; i++)
 			TAILQ_INSERT_TAIL(&evpool->sockets, &evsocket[i], next);
 		evpool->socket_cnt += (SOCKET_PER_ALLOC-1);
-		EVeasy_THREAD_UNLOCK(evpool);
+		EVEASY_THREAD_UNLOCK(evpool);
 	}
 
 	return evsocket;
@@ -164,19 +164,19 @@ eveasy_socket_free(
 	}
 #endif
 
-	EVeasy_THREAD_LOCK(evpool);
+	EVEASY_THREAD_LOCK(evpool);
 	TAILQ_INSERT_TAIL(&evpool->sockets, evsocket, next);
 	evpool->socket_cnt++;
-	EVeasy_THREAD_UNLOCK(evpool);
+	EVEASY_THREAD_UNLOCK(evpool);
 }
 
 static void 
 eveasy_socket_push(
 	struct eveasy_thread *evthread, struct eveasy_socket *evsocket)
 {
-	EVeasy_THREAD_LOCK(evthread);
+	EVEASY_THREAD_LOCK(evthread);
 	TAILQ_INSERT_TAIL(&evthread->sockets, evsocket, next);
-	EVeasy_THREAD_UNLOCK(evthread);
+	EVEASY_THREAD_UNLOCK(evthread);
 }
 
 static struct eveasy_socket *
@@ -184,11 +184,11 @@ eveasy_socket_pop(struct eveasy_thread *evthread)
 {
 	struct eveasy_socket *evsocket;
 
-	EVeasy_THREAD_LOCK(evthread);
+	EVEASY_THREAD_LOCK(evthread);
 	if ((evsocket = TAILQ_FIRST(&evthread->sockets)) != NULL) {
 		TAILQ_REMOVE(&evthread->sockets, evsocket, next);
 	}
-	EVeasy_THREAD_UNLOCK(evthread);
+	EVEASY_THREAD_UNLOCK(evthread);
 
 	return evsocket;
 }
