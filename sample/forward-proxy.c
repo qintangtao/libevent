@@ -61,6 +61,40 @@ void *connection_lock = NULL;
 			EVLOCK_UNLOCK(connection_lock, 0); \
 	} while (0)
 
+
+static void
+conn_print(struct bufferevent *bev, const char *TAG)
+{
+	struct sockaddr_storage ss;
+	evutil_socket_t fd = bufferevent_getfd(bev);
+	ev_socklen_t socklen = sizeof(ss);
+	char addrbuf[128];
+	void *inaddr;
+	const char *addr;
+	uint16_t got_port = -1;
+
+	memset(&ss, 0, sizeof(ss));
+	if (getsockname(fd, (struct sockaddr *)&ss, &socklen)) {
+		perror("getsockname() failed");
+		return;
+	}
+
+	if (ss.ss_family == AF_INET) {
+		got_port = ntohs(((struct sockaddr_in *)&ss)->sin_port);
+		inaddr = &((struct sockaddr_in *)&ss)->sin_addr;
+	} else if (ss.ss_family == AF_INET6) {
+		got_port = ntohs(((struct sockaddr_in6 *)&ss)->sin6_port);
+		inaddr = &((struct sockaddr_in6 *)&ss)->sin6_addr;
+	}
+
+	addr = evutil_inet_ntop(ss.ss_family, inaddr, addrbuf, sizeof(addrbuf));
+	if (addr) {
+		printf("%s on %s:%d\n", TAG, addr, got_port);
+	} else {
+		fprintf(stderr, "evutil_inet_ntop failed\n");
+	}
+}
+
 static void
 readcb(struct bufferevent *bev, void *ctx)
 {
@@ -88,15 +122,17 @@ eventcb(struct bufferevent *bev, short events, void *ctx)
 	struct bufferevent_connection *bev_conn;
 
 	if (events & BEV_EVENT_EOF) {
-		printf("Connection closed.\n");
+		fprintf(stdout, "Connection closed.\n");
 	} else if (events & BEV_EVENT_ERROR) {
-		printf("Got an error on the connection: %s\n",
+		fprintf(stdout, "Got an error on the connection: %s\n",
 			strerror(errno)); /*XXX win32*/
 	} else if (events & BEV_EVENT_TIMEOUT) {
-		printf("Connection timeout.\n");
+		fprintf(stdout, "Connection timeout.\n");
 	} else {
 		return;
 	}
+
+	conn_print(bev, "disconnect");
 
 	BEV_CONNECT_LOCK();
 	if (bev == b_out) {
@@ -148,6 +184,8 @@ bufferevent_connection_add(struct event_base *base, evutil_socket_t fd)
 	BEV_CONNECT_LOCK();
 	TAILQ_INSERT_TAIL(&connections, bev_conn, next);
 	BEV_CONNECT_UNLOCK();
+
+	conn_print(bev_conn->bev, "connect");
 
 	return bev_conn;
 
