@@ -25,8 +25,8 @@
 #include <signal.h>
 #endif
 
-#include <event2/bufferevent_ssl.h>
 #include <event2/bufferevent.h>
+#include <event2/bufferevent_compat.h>
 #include <event2/buffer.h>
 #include <event2/listener.h>
 #include <event2/util.h>
@@ -37,15 +37,19 @@
 #include "compat/sys/queue.h"
 #include "easy_thread.h"
 
-#define MAX_OUTPUT (512*1024)
+
+#define USE_THREAD_POOL
 
 struct bufferevent_connection {
 	TAILQ_ENTRY(bufferevent_connection) next;
 
+	struct event_base *base;
 	struct bufferevent *bev;
 };
 TAILQ_HEAD(bufferevent_connectionq, bufferevent_connection) connections; /* queue of new connections */
 void *connection_lock = NULL;
+
+#ifdef USE_THREAD_POOL
 
 #define BEV_CONNECT_LOCK()        \
 	do {                             \
@@ -58,6 +62,13 @@ void *connection_lock = NULL;
 		if (connection_lock)                         \
 			EVLOCK_UNLOCK(connection_lock, 0); \
 	} while (0)
+
+#else
+
+#define BEV_CONNECT_LOCK()
+#define BEV_CONNECT_UNLOCK()
+
+#endif
 
 static void
 readcb(struct bufferevent *bev, void *ctx)
@@ -78,6 +89,7 @@ readcb(struct bufferevent *bev, void *ctx)
 
 	evbuffer_drain(src, len);
 }
+
 
 static void
 eventcb(struct bufferevent *bev, short events, void *ctx)
@@ -103,7 +115,7 @@ eventcb(struct bufferevent *bev, short events, void *ctx)
 			bufferevent_free(bev_conn->bev);
 			TAILQ_REMOVE(&connections, bev_conn, next);
 			mm_free(bev_conn);
-		}	
+		}
 	} else {
 		// remove client from queue
 		TAILQ_FOREACH (bev_conn, &connections, next) {
@@ -120,20 +132,9 @@ eventcb(struct bufferevent *bev, short events, void *ctx)
 	bufferevent_free(bev);
 }
 
-static void
-accept_socket_cb(struct evconnlistener *listener, evutil_socket_t fd,
-	struct sockaddr *sa, int socklen, void *arg)
+static struct bufferevent_connection *
+bufferevent_connection_add(struct event_base *base, evutil_socket_t fd)
 {
-	struct eveasy_thread_pool *pool = arg;
-	eveasy_thread_pool_assign(pool, fd, sa, socklen);
-}
-
-static void
-new_conn_cb(struct eveasy_thread *evthread, evutil_socket_t fd,
-	struct sockaddr *sa, int socklen, void *arg)
-{
-	struct eveasy_thread_pool *pool = arg;
-	struct event_base *base = eveasy_thread_get_base(evthread);
 	struct bufferevent_connection *bev_conn = NULL;
 
 	bev_conn = mm_calloc(1, sizeof(struct bufferevent_connection));
@@ -142,6 +143,7 @@ new_conn_cb(struct eveasy_thread *evthread, evutil_socket_t fd,
 		goto err;
 	}
 
+	bev_conn->base = base;
 	bev_conn->bev = bufferevent_socket_new(base, fd,
 		BEV_OPT_CLOSE_ON_FREE | BEV_OPT_DEFER_CALLBACKS | BEV_OPT_THREADSAFE);
 	if (!bev_conn->bev) {
@@ -150,19 +152,46 @@ new_conn_cb(struct eveasy_thread *evthread, evutil_socket_t fd,
 	}
 
 	bufferevent_setcb(bev_conn->bev, NULL, NULL, eventcb, NULL);
+	//bufferevent_settimeout(bev_conn->bev, 0, 0);
 	bufferevent_enable(bev_conn->bev, EV_READ);
 
 	BEV_CONNECT_LOCK();
 	TAILQ_INSERT_TAIL(&connections, bev_conn, next);
 	BEV_CONNECT_UNLOCK();
 
-	return;
+	return bev_conn;
 
 err:
 	if (bev_conn)
 		mm_free(bev_conn);
 
-	evutil_closesocket(fd);
+	return NULL;
+}
+
+static void
+accept_socket_cb(struct evconnlistener *listener, evutil_socket_t fd,
+	struct sockaddr *sa, int socklen, void *arg)
+{
+#ifdef USE_THREAD_POOL
+	struct eveasy_thread_pool *pool = arg;
+	eveasy_thread_pool_assign(pool, fd, sa, socklen);
+#else
+	struct event_base *base = arg;
+	
+	if (!bufferevent_connection_add(base, fd))
+		evutil_closesocket(fd);
+#endif
+}
+
+static void
+new_conn_cb(struct eveasy_thread *evthread, evutil_socket_t fd,
+	struct sockaddr *sa, int socklen, void *arg)
+{
+	struct eveasy_thread_pool *pool = arg;
+	struct event_base *base = eveasy_thread_get_base(evthread);
+	
+	if (!bufferevent_connection_add(base, fd))
+		evutil_closesocket(fd);
 }
 
 static void
@@ -241,7 +270,9 @@ main(int argc, char **argv)
 		syntax();
 
 	TAILQ_INIT(&connections);
+#ifdef USE_THREAD_POOL
 	EVTHREAD_ALLOC_LOCK(connection_lock, EVTHREAD_LOCKTYPE_READWRITE);
+#endif
 
 	cfg = event_config_new();
 	if (!cfg) {
@@ -269,6 +300,7 @@ main(int argc, char **argv)
 		goto err;
 	}
 
+#ifdef USE_THREAD_POOL
 	pool = eveasy_thread_pool_new(cfg, 128);
 	if (!pool) {
 		fprintf(stderr, "Couldn't create an eveasy_thread_pool: exiting\n");
@@ -276,6 +308,8 @@ main(int argc, char **argv)
 	}
 
 	eveasy_thread_pool_set_conncb(pool, new_conn_cb, pool);
+
+#endif // USE_THREAD_POOL
 
 	event_config_free(cfg);
 	cfg = NULL;
@@ -295,7 +329,13 @@ main(int argc, char **argv)
 	bufferevent_setcb(bev, readcb, NULL, eventcb, bev);
 	bufferevent_enable(bev, EV_READ);
 
-	listener = evconnlistener_new_bind(base, accept_socket_cb, pool,
+
+	listener = evconnlistener_new_bind(base, accept_socket_cb, 
+#ifdef USE_THREAD_POOL
+		pool,
+#else
+		base,
+#endif
 	    LEV_OPT_CLOSE_ON_FREE|LEV_OPT_CLOSE_ON_EXEC|LEV_OPT_REUSEABLE,
 	    -1, (struct sockaddr*)&listen_on_addr, socklen);
 	if (! listener) {
