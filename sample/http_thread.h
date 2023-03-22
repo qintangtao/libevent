@@ -20,8 +20,9 @@ int evhttp_thread_pool_get_connection_count(struct evhttp_thread_pool *evpool);
 
 int evhttp_thread_pool_get_thread_count(struct evhttp_thread_pool *evpool);
 
-struct evhttp *evhttp_thread_pool_get_http(
-	struct evhttp_thread_pool *evpool, int index);
+struct evhttp_thread *evhttp_thread_pool_get_thread(struct evhttp_thread_pool *evpool, int index);
+
+struct evhttp *evhttp_thread_get_http(struct evhttp_thread *evthread);
 
 #ifdef __cplusplus
 }

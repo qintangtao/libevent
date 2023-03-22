@@ -653,7 +653,6 @@ main(int argc, char **argv)
 	struct event_config *cfg = NULL;
 	struct event_base *base = NULL;
 	struct evhttp *http = NULL;
-	struct evhttp *http_thread = NULL;
 	struct evhttp_bound_socket *handle = NULL;
 	struct evconnlistener *lev = NULL;
 	struct event *term = NULL;
@@ -791,26 +790,25 @@ main(int argc, char **argv)
 	// create http thread pool
 	pool = evhttp_thread_pool_new(cfg, 128);
 	if (pool) {
+		struct evhttp *http;
 
 		nthreads = evhttp_thread_pool_get_thread_count(pool);
+		for (i = 0; i < nthreads; i++) {
+			http = evhttp_thread_get_http(evhttp_thread_pool_get_thread(pool, i));
+			if (http) {
 
-		for (i = 0; i < nthreads; i++)
-		{
-			http_thread = evhttp_thread_pool_get_http(pool, i);
-			if (http_thread) {
-
-				evhttp_set_timeout(http_thread, 30);
+				evhttp_set_timeout(http, 30);
 
 				/* The /dump URI will dump all requests to stdout and say 200
 				 * ok. */
-				evhttp_set_cb(http_thread, "/dump", dump_request_cb, pool);
+				evhttp_set_cb(http, "/dump", dump_request_cb, pool);
 
 				/* We want to accept arbitrary requests, so we need to set a
 				 * "generic"
 				 * cb.  We can also add callbacks for specific paths. */
-				evhttp_set_gencb(http_thread, send_document_cb, &o);
+				evhttp_set_gencb(http, send_document_cb, &o);
 				if (o.max_body_size)
-					evhttp_set_max_body_size(http_thread, o.max_body_size);
+					evhttp_set_max_body_size(http, o.max_body_size);
 			}
 		}
 

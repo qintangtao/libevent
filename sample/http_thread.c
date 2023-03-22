@@ -492,8 +492,8 @@ evhttp_thread_pool_get_thread_count(struct evhttp_thread_pool *evpool)
 	return evpool->thread_cnt;
 }
 
-struct evhttp *
-evhttp_thread_pool_get_http(struct evhttp_thread_pool *evpool, int index)
+struct evhttp_thread *
+evhttp_thread_pool_get_thread(struct evhttp_thread_pool *evpool, int index)
 {
 	if (evpool == NULL)
 		return NULL;
@@ -501,5 +501,10 @@ evhttp_thread_pool_get_http(struct evhttp_thread_pool *evpool, int index)
 	if (index < 0 || index >= evpool->thread_cnt)
 		return NULL;
 
-	return evpool->threads[index].http;
+	return (evpool->threads + index);
+}
+
+struct evhttp *evhttp_thread_get_http(struct evhttp_thread *evthread)
+{
+	return evthread ? evthread->http : NULL;
 }
