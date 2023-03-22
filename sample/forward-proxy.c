@@ -32,120 +32,101 @@
 #include <event2/util.h>
 
 #include "util-internal.h"
-
-static struct event_base *base;
-static struct sockaddr_storage listen_on_addr;
-static struct sockaddr_storage connect_to_addr;
-static int connect_to_addrlen;
-static int use_wrapper = 1;
-
+#include "../mm-internal.h"
+#include "../compat/sys/queue.h"
 
 #define MAX_OUTPUT (512*1024)
 
-static void drained_writecb(struct bufferevent *bev, void *ctx);
-static void eventcb(struct bufferevent *bev, short what, void *ctx);
+struct bufferevent_connection {
+	TAILQ_ENTRY(bufferevent_connection) next;
+
+	struct bufferevent *bev;
+};
+TAILQ_HEAD(bufferevent_connectionq, bufferevent_connection) connections; /* queue of new connections */
 
 static void
 readcb(struct bufferevent *bev, void *ctx)
 {
-	struct bufferevent *partner = ctx;
+	struct bufferevent_connection *bev_conn;
 	struct evbuffer *src, *dst;
 	size_t len;
+
 	src = bufferevent_get_input(bev);
 	len = evbuffer_get_length(src);
-	if (!partner) {
-		evbuffer_drain(src, len);
+
+	TAILQ_FOREACH (bev_conn, &connections, next) {
+		dst = bufferevent_get_output(bev_conn->bev);
+		evbuffer_add_buffer_reference(dst, src);
+	}
+
+	evbuffer_drain(src, len);
+}
+
+static void
+eventcb(struct bufferevent *bev, short events, void *ctx)
+{
+	struct bufferevent *b_out = ctx;
+	struct bufferevent_connection *bev_conn;
+
+	if (events & BEV_EVENT_EOF) {
+		printf("Connection closed.\n");
+	} else if (events & BEV_EVENT_ERROR) {
+		printf("Got an error on the connection: %s\n",
+			strerror(errno)); /*XXX win32*/
+	} else if (events & BEV_EVENT_TIMEOUT) {
+		printf("Connection timeout.\n");
+	} else {
 		return;
 	}
-	dst = bufferevent_get_output(partner);
-	evbuffer_add_buffer(dst, src);
 
-	if (evbuffer_get_length(dst) >= MAX_OUTPUT) {
-		/* We're giving the other side data faster than it can
-		 * pass it on.  Stop reading here until we have drained the
-		 * other side to MAX_OUTPUT/2 bytes. */
-		bufferevent_setcb(partner, readcb, drained_writecb,
-		    eventcb, bev);
-		bufferevent_setwatermark(partner, EV_WRITE, MAX_OUTPUT/2,
-		    MAX_OUTPUT);
-		bufferevent_disable(bev, EV_READ);
-	}
-}
-
-static void
-drained_writecb(struct bufferevent *bev, void *ctx)
-{
-	struct bufferevent *partner = ctx;
-
-	/* We were choking the other side until we drained our outbuf a bit.
-	 * Now it seems drained. */
-	bufferevent_setcb(bev, readcb, NULL, eventcb, partner);
-	bufferevent_setwatermark(bev, EV_WRITE, 0, 0);
-	if (partner)
-		bufferevent_enable(partner, EV_READ);
-}
-
-static void
-close_on_finished_writecb(struct bufferevent *bev, void *ctx)
-{
-	struct evbuffer *b = bufferevent_get_output(bev);
-
-	if (evbuffer_get_length(b) == 0) {
-		bufferevent_free(bev);
-	}
-}
-
-static void
-eventcb(struct bufferevent *bev, short what, void *ctx)
-{
-	struct bufferevent *partner = ctx;
-
-	if (what & (BEV_EVENT_EOF|BEV_EVENT_ERROR)) {
-		if (what & BEV_EVENT_ERROR) {
-
-#if 0
-			unsigned long err;
-			while ((err = (bufferevent_get_openssl_error(bev)))) {
-				const char *msg = (const char*)
-				    ERR_reason_error_string(err);
-				const char *lib = (const char*)
-				    ERR_lib_error_string(err);
-#if OPENSSL_VERSION_NUMBER >= 0x30000000
-				fprintf(stderr,
-					"%s in %s\n", msg, lib);
-#else
-				const char *func = (const char*)
-				    ERR_func_error_string(err);
-				fprintf(stderr,
-				    "%s in %s %s\n", msg, lib, func);
-#endif
-			}
-			if (errno)
-				perror("connection error");
-#endif
-		}
-
-		if (partner) {
-			/* Flush all pending data */
-			readcb(bev, ctx);
-
-			if (evbuffer_get_length(
-				    bufferevent_get_output(partner))) {
-				/* We still have to flush data from the other
-				 * side, but when that's done, close the other
-				 * side. */
-				bufferevent_setcb(partner,
-				    NULL, close_on_finished_writecb,
-				    eventcb, NULL);
-				bufferevent_disable(partner, EV_READ);
-			} else {
-				/* We have nothing left to say to the other
-				 * side; close it. */
-				bufferevent_free(partner);
+	if (bev == b_out) {
+		// close all clients;
+		while ((bev_conn = TAILQ_FIRST(&connections)) != NULL) {
+			bufferevent_free(bev_conn->bev);
+			TAILQ_REMOVE(&connections, bev_conn, next);
+			mm_free(bev_conn);
+		}	
+	} else {
+		// remove client from queue
+		TAILQ_FOREACH (bev_conn, &connections, next) {
+			if (bev_conn->bev == bev) {
+				//bufferevent_free(bev_conn->bev);
+				TAILQ_REMOVE(&connections, bev_conn, next);
+				mm_free(bev_conn);
+				break;
 			}
 		}
-		bufferevent_free(bev);
 	}
+
+	bufferevent_free(bev);
+}
+
+static void
+accept_cb(struct evconnlistener *listener, evutil_socket_t fd,
+    struct sockaddr *a, int slen, void *p)
+{
+	struct event_base *base = p; 
+	struct bufferevent *b_in;
+	
+	b_in = bufferevent_socket_new(base, fd,
+	    BEV_OPT_CLOSE_ON_FREE|BEV_OPT_DEFER_CALLBACKS);
+	if (!b_in) {
+		evutil_closesocket(fd);
+		return;
+	}
+
+	bufferevent_setcb(b_in, NULL, NULL, eventcb, NULL);
+	bufferevent_enable(b_in, EV_READ);
+
+	struct bufferevent_connection *bev_conn = mm_calloc(1, sizeof(struct bufferevent_connection));
+	if (!bev_conn) {
+		event_warn("%s: calloc failed", __func__);
+		bufferevent_free(b_in);
+		return;
+	}
+
+	bev_conn->bev = b_in;
+	TAILQ_INSERT_TAIL(&connections, bev_conn, next);
 }
 
 static void
@@ -159,44 +140,15 @@ syntax(void)
 	exit(1);
 }
 
-static void
-accept_cb(struct evconnlistener *listener, evutil_socket_t fd,
-    struct sockaddr *a, int slen, void *p)
-{
-	struct bufferevent *b_out, *b_in;
-	/* Create two linked bufferevent objects: one to connect, one for the
-	 * new connection */
-	b_in = bufferevent_socket_new(base, fd,
-	    BEV_OPT_CLOSE_ON_FREE|BEV_OPT_DEFER_CALLBACKS);
-
-	b_out = bufferevent_socket_new(
-		base, -1, BEV_OPT_CLOSE_ON_FREE | BEV_OPT_DEFER_CALLBACKS);
-	
-	assert(b_in && b_out);
-
-	if (bufferevent_socket_connect(b_out,
-		(struct sockaddr*)&connect_to_addr, connect_to_addrlen)<0) {
-		perror("bufferevent_socket_connect");
-		bufferevent_free(b_out);
-		bufferevent_free(b_in);
-		return;
-	}
-
-	bufferevent_setcb(b_in, readcb, NULL, eventcb, b_out);
-	bufferevent_setcb(b_out, readcb, NULL, eventcb, b_in);
-
-	bufferevent_enable(b_in, EV_READ|EV_WRITE);
-	bufferevent_enable(b_out, EV_READ|EV_WRITE);
-}
-
 int
 main(int argc, char **argv)
 {
-	int i;
-	int socklen;
-
-	int use_ssl = 0;
-	struct evconnlistener *listener;
+	struct event_base *base = NULL;
+	struct bufferevent *b_out = NULL;
+	struct evconnlistener *listener = NULL;
+	struct sockaddr_storage listen_on_addr;
+	struct sockaddr_storage connect_to_addr;
+	int socklen, connect_to_addrlen, i;
 
 #ifdef _WIN32
 	{
@@ -217,9 +169,9 @@ main(int argc, char **argv)
 
 	for (i=1; i < argc; ++i) {
 		if (!strcmp(argv[i], "-s")) {
-			use_ssl = 1;
+			//use_ssl = 1;
 		} else if (!strcmp(argv[i], "-W")) {
-			use_wrapper = 0;
+			//use_wrapper = 0;
 		} else if (argv[i][0] == '-') {
 			syntax();
 		} else
@@ -228,7 +180,6 @@ main(int argc, char **argv)
 
 	if (i+2 != argc)
 		syntax();
-
 
 	memset(&listen_on_addr, 0, sizeof(listen_on_addr));
 	socklen = sizeof(listen_on_addr);
@@ -250,21 +201,42 @@ main(int argc, char **argv)
 		(struct sockaddr*)&connect_to_addr, &connect_to_addrlen)<0)
 		syntax();
 
+	TAILQ_INIT(&connections);
+
 	base = event_base_new();
 	if (!base) {
 		perror("event_base_new()");
 		return 1;
 	}
 
-	listener = evconnlistener_new_bind(base, accept_cb, NULL,
-	    LEV_OPT_CLOSE_ON_FREE|LEV_OPT_CLOSE_ON_EXEC|LEV_OPT_REUSEABLE,
-	    -1, (struct sockaddr*)&listen_on_addr, socklen);
-
-	if (! listener) {
+	b_out = bufferevent_socket_new(
+		base, -1, BEV_OPT_CLOSE_ON_FREE | BEV_OPT_DEFER_CALLBACKS);
+	if (!b_out) {
 		fprintf(stderr, "Couldn't open listener.\n");
 		event_base_free(base);
-		return 1;
+		return EXIT_FAILURE;
 	}
+	if (bufferevent_socket_connect(b_out, (struct sockaddr *)&connect_to_addr,
+			connect_to_addrlen) < 0) {
+		perror("bufferevent_socket_connect");
+		bufferevent_free(b_out);
+		event_base_free(base);
+		return EXIT_FAILURE;
+	}
+
+	bufferevent_setcb(b_out, readcb, NULL, eventcb, b_out);
+	bufferevent_enable(b_out, EV_READ);
+
+	listener = evconnlistener_new_bind(base, accept_cb, base,
+	    LEV_OPT_CLOSE_ON_FREE|LEV_OPT_CLOSE_ON_EXEC|LEV_OPT_REUSEABLE,
+	    -1, (struct sockaddr*)&listen_on_addr, socklen);
+	if (! listener) {
+		fprintf(stderr, "Couldn't open listener.\n");
+		bufferevent_free(b_out);
+		event_base_free(base);
+		return EXIT_FAILURE;
+	}
+
 	event_base_dispatch(base);
 
 	evconnlistener_free(listener);
@@ -274,5 +246,5 @@ main(int argc, char **argv)
 	WSACleanup();
 #endif
 
-	return 0;
+	return EXIT_SUCCESS;
 }
