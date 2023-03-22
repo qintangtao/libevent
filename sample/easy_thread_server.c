@@ -1,9 +1,11 @@
-#include "server.h"
+#include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 #include <stdio.h>
 #include <signal.h>
 #ifndef _WIN32
+#include <ws2tcpip.h>
 #include <netinet/in.h>
 #ifdef _XOPEN_SOURCE_EXTENDED
 #include <arpa/inet.h>
@@ -22,11 +24,10 @@
 #include <event2/bufferevent_compat.h>
 
 
-#include "thread.h"
+#include "easy_thread.h"
 
 #define CONN_TIMEOUT_READ 30
 #define CONN_TIMEOUT_WRITE 0
-
 
 #pragma pack(push)
 #pragma pack(1)
@@ -231,7 +232,7 @@ new_conn_cb(struct eveasy_thread *evthread,
 }
 
 int
-server_start(unsigned short port)
+main(int argc, char **argv)
 {
 	struct eveasy_thread_pool *pool = NULL;
 	struct event_config *cfg		= NULL;
@@ -239,6 +240,7 @@ server_start(unsigned short port)
 	struct evconnlistener *listener = NULL;
 	struct event *signal_event		= NULL;
 	struct sockaddr_in sin			= {0};
+	unsigned short 					port = 9995;
 	int ret							= EXIT_FAILURE;
 
 #ifdef _WIN32

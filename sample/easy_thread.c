@@ -1,4 +1,4 @@
-#include "thread.h"
+#include "easy_thread.h"
 
 #include <event2/event.h>
 #include <event2/http.h>

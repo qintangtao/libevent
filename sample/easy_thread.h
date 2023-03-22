@@ -1,5 +1,5 @@
-#ifndef __THREAD_H__
-#define __THREAD_H__
+#ifndef __EASY_THREAD_H__
+#define __EASY_THREAD_H__
 
 #include <event2/util.h>
 
@@ -31,4 +31,4 @@ struct event_base *eveasy_thread_get_base(struct eveasy_thread *evthread);
 }
 #endif
 
-#endif //__THREAD_H__
+#endif //__EASY_THREAD_H__

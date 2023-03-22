@@ -1139,6 +1139,9 @@ if (NOT EVENT__DISABLE_SAMPLES)
         time-test
         watch-timing)
 
+    add_sample_prog(OFF easy_thread_server sample/easy_thread_server.c sample/easy_thread.c)
+    add_sample_prog(OFF forward-proxy sample/forward-proxy.c sample/easy_thread.c)
+
     foreach(SAMPLE ${SAMPLES})
         add_sample_prog(OFF ${SAMPLE} sample/${SAMPLE}.c)
     endforeach()
@@ -1172,6 +1175,8 @@ if (NOT EVENT__DISABLE_SAMPLES)
     foreach (SAMPLE ${SAMPLES_WOPT})
         add_sample_prog(OFF ${SAMPLE} sample/${SAMPLE}.c ${WIN32_GETOPT})
     endforeach()
+
+    add_sample_prog(OFF http_thread_server sample/http_thread_server.c sample/http_thread.c ${WIN32_GETOPT})
 endif()
 
 #
