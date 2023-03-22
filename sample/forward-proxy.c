@@ -37,6 +37,7 @@
 #include "compat/sys/queue.h"
 #include "easy_thread.h"
 
+static int use_print_debug = 0;
 static int use_thread_pool = 0;
 
 struct bufferevent_connection {
@@ -45,22 +46,36 @@ struct bufferevent_connection {
 	struct event_base *base;
 	struct bufferevent *bev;
 };
-TAILQ_HEAD(bufferevent_connectionq, bufferevent_connection)
-connections; /* queue of new connections */
-void *connection_lock = NULL;
+
+struct forward_proxy {
+	TAILQ_HEAD(bufferevent_connectionq, bufferevent_connection) connections; /* queue of new connections */
+	void *lock;
+
+	int connection_cnt ;
+} proxy;
+
 
 #define BEV_CONNECT_LOCK()                   \
 	do {                                     \
-		if (connection_lock)                 \
-			EVLOCK_LOCK(connection_lock, 0); \
+		if (proxy.lock)                 \
+			EVLOCK_LOCK(proxy.lock, 0); \
 	} while (0)
 
 #define BEV_CONNECT_UNLOCK()                   \
 	do {                                       \
-		if (connection_lock)                   \
-			EVLOCK_UNLOCK(connection_lock, 0); \
+		if (proxy.lock)						\
+			EVLOCK_UNLOCK(proxy.lock, 0);	\
 	} while (0)
 
+static void 
+init_proxy()
+{
+	proxy.connection_cnt = 0;
+	proxy.lock = NULL;
+	TAILQ_INIT(&proxy.connections);
+	if (use_thread_pool)
+		EVTHREAD_ALLOC_LOCK(proxy.lock, EVTHREAD_LOCKTYPE_READWRITE);
+}
 
 static void
 conn_print(struct bufferevent *bev, const char *TAG)
@@ -106,7 +121,7 @@ readcb(struct bufferevent *bev, void *ctx)
 	len = evbuffer_get_length(src);
 
 	BEV_CONNECT_LOCK();
-	TAILQ_FOREACH (bev_conn, &connections, next) {
+	TAILQ_FOREACH (bev_conn, &proxy.connections, next) {
 		dst = bufferevent_get_output(bev_conn->bev);
 		evbuffer_add_buffer_reference(dst, src);
 	}
@@ -122,38 +137,47 @@ eventcb(struct bufferevent *bev, short events, void *ctx)
 	struct bufferevent_connection *bev_conn;
 
 	if (events & BEV_EVENT_EOF) {
-		fprintf(stdout, "Connection closed.\n");
+		if (use_print_debug)
+			fprintf(stdout, "Connection closed.\n");
 	} else if (events & BEV_EVENT_ERROR) {
-		fprintf(stdout, "Got an error on the connection: %s\n",
+		if (use_print_debug)
+			fprintf(stdout, "Got an error on the connection: %s\n",
 			strerror(errno)); /*XXX win32*/
 	} else if (events & BEV_EVENT_TIMEOUT) {
-		fprintf(stdout, "Connection timeout.\n");
+		if (use_print_debug)
+			fprintf(stdout, "Connection timeout.\n");
 	} else {
 		return;
 	}
 
-	conn_print(bev, "disconnect");
+	if (use_print_debug)
+		conn_print(bev, "disconnect");
 
 	BEV_CONNECT_LOCK();
 	if (bev == b_out) {
 		// close all clients;
-		while ((bev_conn = TAILQ_FIRST(&connections)) != NULL) {
+		while ((bev_conn = TAILQ_FIRST(&proxy.connections)) != NULL) {
 			bufferevent_free(bev_conn->bev);
-			TAILQ_REMOVE(&connections, bev_conn, next);
+			TAILQ_REMOVE(&proxy.connections, bev_conn, next);
 			mm_free(bev_conn);
+			proxy.connection_cnt--;
 		}
 	} else {
 		// remove client from queue
-		TAILQ_FOREACH (bev_conn, &connections, next) {
+		TAILQ_FOREACH (bev_conn, &proxy.connections, next) {
 			if (bev_conn->bev == bev) {
 				// bufferevent_free(bev_conn->bev);
-				TAILQ_REMOVE(&connections, bev_conn, next);
+				TAILQ_REMOVE(&proxy.connections, bev_conn, next);
 				mm_free(bev_conn);
+				proxy.connection_cnt--;
 				break;
 			}
 		}
 	}
 	BEV_CONNECT_UNLOCK();
+
+	if (use_print_debug)
+		fprintf(stdout, "client count: %d\n", proxy.connection_cnt);
 
 	bufferevent_free(bev);
 }
@@ -182,10 +206,14 @@ bufferevent_connection_add(struct event_base *base, evutil_socket_t fd)
 	bufferevent_enable(bev_conn->bev, EV_READ);
 
 	BEV_CONNECT_LOCK();
-	TAILQ_INSERT_TAIL(&connections, bev_conn, next);
+	TAILQ_INSERT_TAIL(&proxy.connections, bev_conn, next);
+	proxy.connection_cnt++;
 	BEV_CONNECT_UNLOCK();
 
-	conn_print(bev_conn->bev, "connect");
+	if (use_print_debug) {
+		conn_print(bev_conn->bev, "connect");
+		fprintf(stdout, "client count: %d\n", proxy.connection_cnt);
+	}
 
 	return bev_conn;
 
@@ -226,7 +254,7 @@ static void
 syntax(void)
 {
 	fputs("Syntax:\n", stderr);
-	fputs("   forward-proxy [-t] <listen-on-addr> <connect-to-addr>\n", stderr);
+	fputs("   forward-proxy [-t] [-p] <listen-on-addr> <connect-to-addr>\n", stderr);
 	fputs("Example:\n", stderr);
 	fputs("   forward-proxy 127.0.0.1:8888 1.2.3.4:80\n", stderr);
 
@@ -266,8 +294,8 @@ main(int argc, char **argv)
 	for (i = 1; i < argc; ++i) {
 		if (!strcmp(argv[i], "-t")) {
 			use_thread_pool = 1;
-		} else if (!strcmp(argv[i], "-W")) {
-			// use_wrapper = 0;
+		} else if (!strcmp(argv[i], "-p")) {
+			use_print_debug = 1;
 		} else if (argv[i][0] == '-') {
 			syntax();
 		} else
@@ -297,9 +325,7 @@ main(int argc, char **argv)
 			(struct sockaddr *)&connect_to_addr, &connect_to_addrlen) < 0)
 		syntax();
 
-	TAILQ_INIT(&connections);
-	if (use_thread_pool)
-		EVTHREAD_ALLOC_LOCK(connection_lock, EVTHREAD_LOCKTYPE_READWRITE);
+	init_proxy();
 
 	cfg = event_config_new();
 	if (!cfg) {
