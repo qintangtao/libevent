@@ -1477,7 +1477,7 @@ char *evhttp_uri_join(struct evhttp_uri *uri, char *buf, size_t limit);
 
 
 /*
- 更改后可用于线程池调用
+* evhttp_get_request
 */
 EVENT2_EXPORT_SYMBOL
 void evhttp_get_request(struct evhttp *http, evutil_socket_t fd,

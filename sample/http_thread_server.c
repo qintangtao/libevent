@@ -7,11 +7,7 @@
  */
 
 /* Compatibility for possible missing IPv6 declarations */
-#include "../util-internal.h"
-#include "../evthread-internal.h"
-#include "../compat/sys/queue.h"
-#include "http_thread.h"
-
+#include "event2/event-config.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -45,6 +41,7 @@
 #include <afunix.h>
 #endif
 
+#include <event2/http_thread.h>
 #include <event2/event.h>
 #include <event2/http.h>
 #include <event2/listener.h>
@@ -56,6 +53,11 @@
 #ifdef _WIN32
 #include <event2/thread.h>
 #endif /* _WIN32 */
+
+#include "util-internal.h"
+#include "evthread-internal.h"
+#include "compat/sys/queue.h"
+
 
 #ifdef EVENT__HAVE_NETINET_IN_H
 #include <netinet/in.h>

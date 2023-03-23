@@ -21,9 +21,8 @@
 #include <event2/thread.h>
 #include <event2/bufferevent.h>
 #include <event2/bufferevent_compat.h>
+#include <event2/easy_thread.h>
 
-
-#include "easy_thread.h"
 
 #define CONN_TIMEOUT_READ 30
 #define CONN_TIMEOUT_WRITE 0

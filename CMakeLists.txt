@@ -870,6 +870,8 @@ set(HDR_PUBLIC
     include/event2/util.h
     include/event2/ws.h
     include/event2/visibility.h
+    include/event2/easy_thread.h
+    include/event2/http_thread.h
     ${PROJECT_BINARY_DIR}/include/event2/event-config.h)
 
 list(APPEND SRC_CORE
@@ -987,7 +989,9 @@ set(SRC_EXTRA
     evdns.c
     ws.c
     sha1.c
-    evrpc.c)
+    evrpc.c
+    easy_thread.c
+    http_thread.c)
 
 if("${CMAKE_MAJOR_VERSION}.${CMAKE_MINOR_VERSION}" LESS 3.20)
   include(TestBigEndian)
@@ -1137,10 +1141,9 @@ if (NOT EVENT__DISABLE_SAMPLES)
         signal-test
         http-connect
         time-test
-        watch-timing)
-
-    add_sample_prog(OFF easy_thread_server sample/easy_thread_server.c sample/easy_thread.c)
-    add_sample_prog(OFF forward-proxy sample/forward-proxy.c sample/easy_thread.c)
+        watch-timing
+        easy_thread_server
+        forward-proxy)
 
     foreach(SAMPLE ${SAMPLES})
         add_sample_prog(OFF ${SAMPLE} sample/${SAMPLE}.c)
@@ -1171,12 +1174,11 @@ if (NOT EVENT__DISABLE_SAMPLES)
         dns-example
         ws-chat-server
         http-server
+        http_thread_server
     )
     foreach (SAMPLE ${SAMPLES_WOPT})
         add_sample_prog(OFF ${SAMPLE} sample/${SAMPLE}.c ${WIN32_GETOPT})
     endforeach()
-
-    add_sample_prog(OFF http_thread_server sample/http_thread_server.c sample/http_thread.c ${WIN32_GETOPT})
 endif()
 
 #

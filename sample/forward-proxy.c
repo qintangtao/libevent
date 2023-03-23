@@ -30,12 +30,12 @@
 #include <event2/buffer.h>
 #include <event2/listener.h>
 #include <event2/util.h>
+#include <event2/easy_thread.h>
 
 #include "evthread-internal.h"
 #include "util-internal.h"
 #include "mm-internal.h"
 #include "compat/sys/queue.h"
-#include "easy_thread.h"
 
 static int use_print_debug = 0;
 static int use_thread_pool = 0;
