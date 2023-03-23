@@ -89,7 +89,7 @@ conn_print(struct bufferevent *bev, const char *TAG)
 	uint16_t got_port = -1;
 
 	memset(&ss, 0, sizeof(ss));
-	if (getsockname(fd, (struct sockaddr *)&ss, &socklen)) {
+	if (getpeername(fd, (struct sockaddr *)&ss, &socklen)) {
 		perror("getsockname() failed");
 		return;
 	}

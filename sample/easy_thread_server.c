@@ -23,6 +23,8 @@
 #include <event2/bufferevent_compat.h>
 #include <event2/easy_thread.h>
 
+#include "evthread-internal.h"
+
 
 #define CONN_TIMEOUT_READ 30
 #define CONN_TIMEOUT_WRITE 0
@@ -43,14 +45,7 @@ typedef struct _RPC_PACKET {
 #define RPC_MAJOR_VERSION 0x01
 #define RPC_MINOR_VERSION 0x01
 
-static void
-accept_socket_cb(struct evconnlistener *listener, evutil_socket_t fd,
-	struct sockaddr *sa, int socklen, void *arg)
-{
-	struct eveasy_thread_pool *pool = arg;
-
-	eveasy_thread_pool_assign(pool, fd, sa, socklen);
-}
+static int use_thread_pool = 0;
 
 static void
 signal_cb(evutil_socket_t sig, short events, void *user_data)
@@ -84,7 +79,7 @@ conn_print(struct bufferevent *bev, const char *TAG)
 	uint16_t got_port = -1;
 
 	memset(&ss, 0, sizeof(ss));
-	if (getsockname(fd, (struct sockaddr *)&ss, &socklen)) {
+	if (getpeername(fd, (struct sockaddr *)&ss, &socklen)) {
 		perror("getsockname() failed");
 		return;
 	}
@@ -99,7 +94,8 @@ conn_print(struct bufferevent *bev, const char *TAG)
 
 	addr = evutil_inet_ntop(ss.ss_family, inaddr, addrbuf, sizeof(addrbuf));
 	if (addr) {
-		printf("%s on %s:%d\n", TAG, addr, got_port);
+		printf("%s on %s:%d threadid:%d\n", TAG, addr, got_port,
+			EVTHREAD_GET_ID());
 	} else {
 		fprintf(stderr, "evutil_inet_ntop failed\n");
 	}
@@ -208,16 +204,14 @@ conn_eventcb(struct bufferevent *bev, short events, void *user_data)
 	bufferevent_free(bev);
 }
 
-static void
-new_conn_cb(struct eveasy_thread *evthread,
-	evutil_socket_t fd, struct sockaddr *sa, int socklen, void *arg)
+static struct bufferevent *
+create_bufferevent_socket(struct event_base *base, evutil_socket_t fd)
 {
-	struct eveasy_thread_pool *pool = arg;
-	struct event_base *base = eveasy_thread_get_base(evthread);
 	struct bufferevent *bev;
 
 	// create client socket
-	bev = bufferevent_socket_new(base, fd, BEV_OPT_CLOSE_ON_FREE | BEV_OPT_THREADSAFE);
+	bev = bufferevent_socket_new(
+		base, fd, BEV_OPT_CLOSE_ON_FREE | BEV_OPT_THREADSAFE);
 	if (bev) {
 
 		bufferevent_setcb(bev, conn_readcb, conn_writecb, conn_eventcb, NULL);
@@ -225,11 +219,45 @@ new_conn_cb(struct eveasy_thread *evthread,
 		// bufferevent_enable(bev, EV_WRITE);
 		bufferevent_enable(bev, EV_READ);
 
+		return bev;
+
 	} else {
 		fprintf(stderr, "Error constructing bufferevent!");
 		evutil_closesocket(fd);
 	}
+
+	return NULL;
 }
+
+static void
+new_conn_cb(struct eveasy_thread *evthread,
+	evutil_socket_t fd, struct sockaddr *sa, int socklen, void *arg)
+{
+	struct eveasy_thread_pool *pool = arg;
+	struct event_base *base = eveasy_thread_get_base(evthread);
+	
+	create_bufferevent_socket(base, fd);
+}
+
+static void
+accept_socket_cb(struct evconnlistener *listener, evutil_socket_t fd,
+	struct sockaddr *sa, int socklen, void *arg)
+{
+	if (use_thread_pool) {
+		
+		struct eveasy_thread_pool *pool = arg;
+
+		eveasy_thread_pool_assign(pool, fd, sa, socklen);
+
+	} else {
+
+		struct event_base *base = arg;
+
+		create_bufferevent_socket(base, fd);
+
+	}
+}
+
 
 int
 main(int argc, char **argv)
@@ -279,27 +307,36 @@ main(int argc, char **argv)
 		goto err;
 	}
 	
-	pool = eveasy_thread_pool_new(cfg, 128);
-	if (!pool) {
-		fprintf(stderr, "Couldn't create an eveasy_thread_pool: exiting\n");
-		goto err;
+	if (use_thread_pool) {
+		pool = eveasy_thread_pool_new(cfg, 128);
+		if (!pool) {
+			fprintf(stderr, "Couldn't create an eveasy_thread_pool: exiting\n");
+			goto err;
+		}
+
+		eveasy_thread_pool_set_conncb(pool, new_conn_cb, pool);
 	}
-
-	eveasy_thread_pool_set_conncb(pool, new_conn_cb, pool);
-
+	
 	event_config_free(cfg);
 	cfg = NULL;
 
 	sin.sin_family = AF_INET;
 	sin.sin_port = htons(port);
 
-	listener = evconnlistener_new_bind(base, accept_socket_cb, (void *)pool,
-		LEV_OPT_REUSEABLE | LEV_OPT_CLOSE_ON_FREE, -1, (struct sockaddr *)&sin, sizeof(sin));
+	if (use_thread_pool) {
+		listener = evconnlistener_new_bind(base, accept_socket_cb, (void *)pool,
+			LEV_OPT_REUSEABLE | LEV_OPT_CLOSE_ON_FREE, -1,
+			(struct sockaddr *)&sin, sizeof(sin));
+	} else {
+		listener = evconnlistener_new_bind(base, accept_socket_cb, (void *)base,
+			LEV_OPT_REUSEABLE | LEV_OPT_CLOSE_ON_FREE, -1,
+			(struct sockaddr *)&sin, sizeof(sin));
+	}
 	if (!listener) {
 		fprintf(stderr, "Could not create a listener!\n");
 		goto err;
 	}
-
+	
 	signal_event = evsignal_new(base, SIGINT, signal_cb, (void *)base);
 	if (!signal_event || event_add(signal_event, NULL) < 0) {
 		fprintf(stderr, "Could not create/add a signal event!\n");
