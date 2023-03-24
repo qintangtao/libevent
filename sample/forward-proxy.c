@@ -248,8 +248,6 @@ event_cb(struct bufferevent *bev, short events, void *arg)
 		return;
 	}
 
-	if (use_print_debug)
-		bev_print(bev, "disconnect");
 
 	if (bev == b_out) {
 		// delay to connect
@@ -268,6 +266,9 @@ event_cb(struct bufferevent *bev, short events, void *arg)
 			}
 		}
 		BEV_CONNECT_UNLOCK();
+
+		if (use_print_debug)
+			bev_print(bev, "disconnect");
 
 		if (use_print_debug)
 			fprintf(stdout, "client count: %d\n", proxy.connection_cnt);
