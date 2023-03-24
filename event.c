@@ -836,6 +836,10 @@ event_base_stop_iocp_(struct event_base *base)
 		return;
 	rv = event_iocp_shutdown_(base->iocp, -1);
 	EVUTIL_ASSERT(rv >= 0);
+
+	if (base->iocp == event_global_current_iocp_)
+		event_global_current_iocp_ = NULL;
+
 	base->iocp = NULL;
 #endif
 }
