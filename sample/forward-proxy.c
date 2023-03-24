@@ -37,8 +37,13 @@
 #include "mm-internal.h"
 #include "compat/sys/queue.h"
 
-static int use_print_debug = 0;
-static int use_thread_pool = 0;
+static struct sockaddr_storage connect_to_addr;
+static int connect_to_addrlen;
+static int use_print_debug			= 0;
+static int use_thread_pool			= 0;
+static struct timeval tv_read		= {30, 0};
+static struct timeval tv_connect	= {5, 0};
+static struct event *connect_timer	= NULL;
 
 struct bufferevent_connection {
 	TAILQ_ENTRY(bufferevent_connection) next;
@@ -111,8 +116,84 @@ conn_print(struct bufferevent *bev, const char *TAG)
 	}
 }
 
+static void event_cb(struct bufferevent *bev, short events, void *arg);
+static void read_cb(struct bufferevent *bev, void *arg);
+
+static struct bufferevent_connection *
+add_bufferevent_connection(struct event_base *base, evutil_socket_t fd)
+{
+	struct bufferevent_connection *bev_conn = NULL;
+
+	bev_conn = mm_calloc(1, sizeof(struct bufferevent_connection));
+	if (!bev_conn) {
+		event_warn("%s: calloc failed", __func__);
+		goto err;
+	}
+
+	bev_conn->base = base;
+	bev_conn->bev = bufferevent_socket_new(base, fd,
+		BEV_OPT_CLOSE_ON_FREE | BEV_OPT_DEFER_CALLBACKS | BEV_OPT_THREADSAFE);
+	if (!bev_conn->bev) {
+		event_warn("%s: bufferevent socket new failed", __func__);
+		goto err;
+	}
+
+	bufferevent_setcb(bev_conn->bev, NULL, NULL, event_cb, NULL);
+	bufferevent_enable(bev_conn->bev, EV_READ | EV_WRITE);
+
+	BEV_CONNECT_LOCK();
+	TAILQ_INSERT_TAIL(&proxy.connections, bev_conn, next);
+	proxy.connection_cnt++;
+	BEV_CONNECT_UNLOCK();
+
+	if (use_print_debug) {
+		conn_print(bev_conn->bev, "connect");
+		fprintf(stdout, "client count: %d\n", proxy.connection_cnt);
+	}
+
+	return bev_conn;
+
+err:
+	if (bev_conn)
+		mm_free(bev_conn);
+
+	evutil_closesocket(fd);
+
+	return NULL;
+}
+
+static struct bufferevent *
+create_bufferevent_socket(struct event_base *base)
+{
+	struct bufferevent *bev = NULL;
+
+	bev = bufferevent_socket_new(base, -1,
+		BEV_OPT_CLOSE_ON_FREE | BEV_OPT_DEFER_CALLBACKS | BEV_OPT_THREADSAFE);
+	if (!bev) {
+		fprintf(stderr, "Couldn't open listener.\n");
+		goto err;
+	}
+	if (bufferevent_socket_connect(
+			bev, (struct sockaddr *)&connect_to_addr, connect_to_addrlen) < 0) {
+		perror("bufferevent socket connect");
+		goto err;
+	}
+
+	bufferevent_setcb(bev, read_cb, NULL, event_cb, bev);
+	bufferevent_set_timeouts(bev, &tv_read, NULL);
+	bufferevent_enable(bev, EV_READ);
+
+	return bev;
+
+err:
+	if (bev)
+		bufferevent_free(bev);
+
+	return NULL;
+}
+
 static void
-readcb(struct bufferevent *bev, void *ctx)
+read_cb(struct bufferevent *bev, void *arg)
 {
 	struct bufferevent_connection *bev_conn;
 	struct evbuffer *src, *dst, *tmp;
@@ -139,7 +220,7 @@ readcb(struct bufferevent *bev, void *ctx)
 }
 
 static void
-writecb(struct bufferevent *bev, void *ctx)
+write_cb(struct bufferevent *bev, void *arg)
 {
 	struct evbuffer *output = bufferevent_get_output(bev);
 	if (evbuffer_get_length(output) == 0) {
@@ -148,9 +229,9 @@ writecb(struct bufferevent *bev, void *ctx)
 }
 
 static void
-eventcb(struct bufferevent *bev, short events, void *ctx)
+event_cb(struct bufferevent *bev, short events, void *arg)
 {
-	struct bufferevent *b_out = ctx;
+	struct bufferevent *b_out = arg;
 	struct bufferevent_connection *bev_conn;
 
 	if (events & BEV_EVENT_EOF) {
@@ -170,17 +251,13 @@ eventcb(struct bufferevent *bev, short events, void *ctx)
 	if (use_print_debug)
 		conn_print(bev, "disconnect");
 
-	BEV_CONNECT_LOCK();
 	if (bev == b_out) {
-		// close all clients;
-		while ((bev_conn = TAILQ_FIRST(&proxy.connections)) != NULL) {
-			bufferevent_free(bev_conn->bev);
-			TAILQ_REMOVE(&proxy.connections, bev_conn, next);
-			mm_free(bev_conn);
-			proxy.connection_cnt--;
-		}
+		// delay to connect
+		if (connect_timer)
+			evtimer_add(connect_timer, &tv_connect);
 	} else {
 		// remove client from queue
+		BEV_CONNECT_LOCK();
 		TAILQ_FOREACH (bev_conn, &proxy.connections, next) {
 			if (bev_conn->bev == bev) {
 				// bufferevent_free(bev_conn->bev);
@@ -190,55 +267,25 @@ eventcb(struct bufferevent *bev, short events, void *ctx)
 				break;
 			}
 		}
-	}
-	BEV_CONNECT_UNLOCK();
+		BEV_CONNECT_UNLOCK();
 
-	if (use_print_debug)
-		fprintf(stdout, "client count: %d\n", proxy.connection_cnt);
+		if (use_print_debug)
+			fprintf(stdout, "client count: %d\n", proxy.connection_cnt);
+	}
 
 	bufferevent_free(bev);
 }
 
-static struct bufferevent_connection *
-bufferevent_connection_add(struct event_base *base, evutil_socket_t fd)
+static void
+time_cb(evutil_socket_t fd, short event, void *arg)
 {
-	struct bufferevent_connection *bev_conn = NULL;
+	struct event_base *base = arg;
 
-	bev_conn = mm_calloc(1, sizeof(struct bufferevent_connection));
-	if (!bev_conn) {
-		event_warn("%s: calloc failed", __func__);
-		goto err;
+	if (!create_bufferevent_socket(base)) {
+		// delay to connect
+		if (connect_timer)
+			evtimer_add(connect_timer, &tv_connect);
 	}
-
-	bev_conn->base = base;
-	bev_conn->bev = bufferevent_socket_new(base, fd,
-		BEV_OPT_CLOSE_ON_FREE | BEV_OPT_DEFER_CALLBACKS | BEV_OPT_THREADSAFE);
-	if (!bev_conn->bev) {
-		event_warn("%s: bufferevent socket new failed", __func__);
-		goto err;
-	}
-
-	bufferevent_setcb(bev_conn->bev, NULL, NULL, eventcb, NULL);
-	// bufferevent_settimeout(bev_conn->bev, 0, 0);
-	bufferevent_enable(bev_conn->bev, EV_READ | EV_WRITE);
-
-	BEV_CONNECT_LOCK();
-	TAILQ_INSERT_TAIL(&proxy.connections, bev_conn, next);
-	proxy.connection_cnt++;
-	BEV_CONNECT_UNLOCK();
-
-	if (use_print_debug) {
-		conn_print(bev_conn->bev, "connect");
-		fprintf(stdout, "client count: %d\n", proxy.connection_cnt);
-	}
-
-	return bev_conn;
-
-err:
-	if (bev_conn)
-		mm_free(bev_conn);
-
-	return NULL;
 }
 
 static void
@@ -250,21 +297,16 @@ accept_socket_cb(struct evconnlistener *listener, evutil_socket_t fd,
 		eveasy_thread_pool_assign(pool, fd, sa, socklen);
 	} else {
 		struct event_base *base = arg;
-
-		if (!bufferevent_connection_add(base, fd))
-			evutil_closesocket(fd);
+		add_bufferevent_connection(base, fd);
 	}
 }
 
 static void
-new_conn_cb(struct eveasy_thread *evthread, evutil_socket_t fd,
+easyconn_cb(struct eveasy_thread *evthread, evutil_socket_t fd,
 	struct sockaddr *sa, int socklen, void *arg)
 {
-	struct eveasy_thread_pool *pool = arg;
 	struct event_base *base = eveasy_thread_get_base(evthread);
-
-	if (!bufferevent_connection_add(base, fd))
-		evutil_closesocket(fd);
+	add_bufferevent_connection(base, fd);
 }
 
 static void
@@ -276,20 +318,19 @@ syntax(void)
 	fputs("Example:\n", stderr);
 	fputs("   forward-proxy 127.0.0.1:8888 1.2.3.4:80\n", stderr);
 
-	exit(1);
+	exit(EXIT_FAILURE);
 }
 
 int
 main(int argc, char **argv)
 {
+	struct event_config *cfg		= NULL;
+	struct event_base *base			= NULL;
+	struct bufferevent *bev			= NULL;
 	struct eveasy_thread_pool *pool = NULL;
-	struct event_config *cfg = NULL;
-	struct event_base *base = NULL;
-	struct bufferevent *bev = NULL;
 	struct evconnlistener *listener = NULL;
 	struct sockaddr_storage listen_on_addr;
-	struct sockaddr_storage connect_to_addr;
-	int socklen, connect_to_addrlen, i;
+	int socklen, i;
 	int ret = EXIT_FAILURE;
 
 #ifdef _WIN32
@@ -379,26 +420,18 @@ main(int argc, char **argv)
 			goto err;
 		}
 
-		eveasy_thread_pool_set_conncb(pool, new_conn_cb, pool);
+		eveasy_thread_pool_set_conncb(pool, easyconn_cb, NULL);
 	}
 
 	event_config_free(cfg);
 	cfg = NULL;
 
-	bev = bufferevent_socket_new(base, -1,
-		BEV_OPT_CLOSE_ON_FREE | BEV_OPT_DEFER_CALLBACKS | BEV_OPT_THREADSAFE);
+	bev = create_bufferevent_socket(base);
 	if (!bev) {
-		fprintf(stderr, "Couldn't open listener.\n");
-		goto err;
-	}
-	if (bufferevent_socket_connect(
-			bev, (struct sockaddr *)&connect_to_addr, connect_to_addrlen) < 0) {
-		perror("bufferevent_socket_connect");
 		goto err;
 	}
 
-	bufferevent_setcb(bev, readcb, NULL, eventcb, bev);
-	bufferevent_enable(bev, EV_READ);
+	connect_timer = evtimer_new(base, time_cb, base);
 
 	if (use_thread_pool) {
 		listener = evconnlistener_new_bind(base, accept_socket_cb, pool,
@@ -430,6 +463,8 @@ err:
 		evconnlistener_free(listener);
 	if (base)
 		event_base_free(base);
+	if (connect_timer)
+		evtimer_del(connect_timer);
 
 #ifdef _WIN32
 	WSACleanup();
