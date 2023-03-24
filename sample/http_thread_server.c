@@ -693,7 +693,8 @@ main(int argc, char **argv)
 		evthread_use_windows_threads();
 		event_config_set_num_cpus_hint(cfg, si.dwNumberOfProcessors);
 #endif
-		event_config_set_flag(cfg, EVENT_BASE_FLAG_STARTUP_IOCP);
+		event_config_set_flag(
+			cfg, EVENT_BASE_FLAG_STARTUP_IOCP | EVENT_BASE_FLAG_INHERIT_IOCP);
 	}
 #else
 

@@ -414,6 +414,11 @@ struct event_config {
 	int limit_callbacks_after_prio;
 	enum event_method_feature require_features;
 	enum event_base_config_flag flags;
+
+#ifdef _WIN32
+	/** IOCP support structure, if IOCP is enabled. */
+	struct event_iocp_port *iocp;
+#endif
 };
 
 /* Internal use only: Functions that might be missing from <sys/queue.h> */

@@ -602,6 +602,28 @@ enum event_base_config_flag {
 	/** Do not use signalfd(2) to handle signals even if supported.
 	 */
 	EVENT_BASE_FLAG_DISALLOW_SIGNALFD = 0x80,
+
+	/** Windows only: enable the IOCP dispatcher at startup
+
+		If this flag is set then bufferevent_socket_new() and
+		evconn_listener_new() will use IOCP-backed implementations
+		instead of the usual select-based one on Windows.
+		inherit
+		Note: it is experimental feature, and has some bugs.
+		可以再子线程中共用同一个iocp
+	 */
+	EVENT_BASE_FLAG_INHERIT_IOCP = 0x100,
+
+	/** Windows only: enable the IOCP dispatcher at startup
+
+		If this flag is set then bufferevent_socket_new() and
+		evconn_listener_new() will use IOCP-backed implementations
+		instead of the usual select-based one on Windows.
+		inherit
+		Note: it is experimental feature, and has some bugs.
+		全局共用同一个iocp
+	 */
+	EVENT_BASE_FLAG_GLOBAL_INHERIT_IOCP = 0x200,
 };
 
 /**

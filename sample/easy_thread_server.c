@@ -45,7 +45,8 @@ typedef struct _RPC_PACKET {
 #define RPC_MAJOR_VERSION 0x01
 #define RPC_MINOR_VERSION 0x01
 
-static int use_thread_pool = 0;
+static int use_thread_pool = 1;
+static uint64_t print_index = 0;
 
 static void
 signal_cb(evutil_socket_t sig, short events, void *user_data)
@@ -94,7 +95,8 @@ conn_print(struct bufferevent *bev, const char *TAG)
 
 	addr = evutil_inet_ntop(ss.ss_family, inaddr, addrbuf, sizeof(addrbuf));
 	if (addr) {
-		printf("%s on %s:%d threadid:%d\n", TAG, addr, got_port,
+		printf("[%lld] %s on %s:%d threadid:%d\n", print_index++, TAG, addr,
+			got_port,
 			EVTHREAD_GET_ID());
 	} else {
 		fprintf(stderr, "evutil_inet_ntop failed\n");
@@ -104,6 +106,16 @@ conn_print(struct bufferevent *bev, const char *TAG)
 static void
 conn_readcb(struct bufferevent *bev, void *user_data)
 {
+#if 1
+	ev_ssize_t size;
+	struct evbuffer *input = bufferevent_get_input(bev);
+
+	if ((size = evbuffer_get_length(input)) > 0)
+		evbuffer_drain(input, size);
+	
+	conn_print(bev, "Reading");
+
+#else
 	RPC_PACKET *packet;
 	uint8_t data[1024];
 	ev_ssize_t total;
@@ -172,6 +184,7 @@ conn_readcb(struct bufferevent *bev, void *user_data)
 	}
 
 	evbuffer_free(body);
+#endif
 }
 
 static void
@@ -215,9 +228,11 @@ create_bufferevent_socket(struct event_base *base, evutil_socket_t fd)
 	if (bev) {
 
 		bufferevent_setcb(bev, conn_readcb, conn_writecb, conn_eventcb, NULL);
-		bufferevent_settimeout(bev, CONN_TIMEOUT_READ, CONN_TIMEOUT_WRITE);
+		// bufferevent_settimeout(bev, CONN_TIMEOUT_READ, CONN_TIMEOUT_WRITE);
 		// bufferevent_enable(bev, EV_WRITE);
 		bufferevent_enable(bev, EV_READ);
+
+		conn_print(bev, "Connected");
 
 		return bev;
 
@@ -294,7 +309,8 @@ main(int argc, char **argv)
 	evthread_use_windows_threads();
 	event_config_set_num_cpus_hint(cfg, si.dwNumberOfProcessors);
 #endif
-	event_config_set_flag(cfg, EVENT_BASE_FLAG_STARTUP_IOCP);
+	event_config_set_flag(
+		cfg, EVENT_BASE_FLAG_STARTUP_IOCP | EVENT_BASE_FLAG_INHERIT_IOCP);
 #else
 #ifdef EVTHREAD_USE_PTHREADS_IMPLEMENTED
 	evthread_use_pthreads();
