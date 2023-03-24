@@ -626,16 +626,6 @@ display_listen_sock(struct evhttp_bound_socket *handle)
 	return 0;
 }
 
-/* Listener callback when a connection arrives at a server. */
-static void
-accept_socket_cb(struct evconnlistener *listener, evutil_socket_t nfd,
-	struct sockaddr *peer_sa, int peer_socklen, void *arg)
-{
-	struct evhttp_thread_pool *pool = arg;
-
-	evhttp_thread_pool_assign(pool, nfd, peer_sa, peer_socklen);
-}
-
 int
 main(int argc, char **argv)
 {
@@ -784,9 +774,8 @@ main(int argc, char **argv)
 			}
 		}
 
-		// reset connlistener cb
-		evconnlistener_set_cb(
-			evhttp_bound_socket_get_listener(handle), accept_socket_cb, pool);
+		// enabled accept socket
+		evhttp_thread_pool_enable_bound_socket(pool, handle);
 	}
 	event_config_free(cfg);
 	cfg = NULL;

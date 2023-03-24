@@ -10,6 +10,7 @@ extern "C" {
 
 struct evhttp_thread;
 struct evhttp_thread_pool;
+struct evhttp_bound_socke;
 
 EVENT2_EXPORT_SYMBOL
 struct evhttp_thread_pool *evhttp_thread_pool_new(const struct event_config *cfg, int nthreads);
@@ -18,7 +19,7 @@ EVENT2_EXPORT_SYMBOL
 void evhttp_thread_pool_free(struct evhttp_thread_pool *evpool);
 
 EVENT2_EXPORT_SYMBOL
-void evhttp_thread_pool_assign(struct evhttp_thread_pool *evpool, evutil_socket_t nfd, struct sockaddr *addr, int addrlen);
+void evhttp_thread_pool_enable_bound_socket(struct evhttp_thread_pool *evpool, struct evhttp_bound_socket *bound);
 
 EVENT2_EXPORT_SYMBOL
 int evhttp_thread_pool_get_connection_count(struct evhttp_thread_pool *evpool);

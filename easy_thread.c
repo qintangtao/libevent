@@ -382,7 +382,8 @@ eveasy_thread_pool_new(const struct event_config *cfg, int nthreads)
 	return evpool;
 
 error:
-	eveasy_thread_pool_free(evpool);
+	if (evpool)
+		eveasy_thread_pool_free(evpool);
 
 	return NULL;
 }

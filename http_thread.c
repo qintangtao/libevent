@@ -191,6 +191,20 @@ evhttp_socket_pop(struct evhttp_thread *evthread)
 	return evsocket;
 }
 
+static void evhttp_thread_pool_assign(struct evhttp_thread_pool *evpool,
+	evutil_socket_t nfd, struct sockaddr *addr, int addrlen);
+
+	/* Listener callback when a connection arrives at a server. */
+static void
+accept_socket_cb(struct evconnlistener *listener, evutil_socket_t nfd,
+	struct sockaddr *peer_sa, int peer_socklen, void *arg)
+{
+	struct evhttp_thread_pool *pool = arg;
+
+	evhttp_thread_pool_assign(pool, nfd, peer_sa, peer_socklen);
+}
+
+
 static void
 thread_process(evutil_socket_t fd, short which, void *arg)
 {
@@ -393,7 +407,8 @@ evhttp_thread_pool_new(const struct event_config *cfg, int nthreads)
 	return evpool;
 
 error:
-	evhttp_thread_pool_free(evpool);
+	if (evpool)
+		evhttp_thread_pool_free(evpool);
 
 	return NULL;
 }
@@ -431,13 +446,16 @@ evhttp_thread_pool_free(struct evhttp_thread_pool *evpool)
 	mm_free(evpool);
 }
 
-void
+static void
 evhttp_thread_pool_assign(struct evhttp_thread_pool *evpool,
 	evutil_socket_t nfd, struct sockaddr *addr, int addrlen)
 {
 	char buf[1];
 	struct evhttp_socket *evsocket = NULL;
 	struct evhttp_thread *evthread = NULL;
+
+	if (!evpool)
+		return;
 
 	evsocket = evhttp_socket_new(evpool);
 	if (evsocket == NULL) {
@@ -466,6 +484,26 @@ error:
 
 	if (evsocket)
 		evhttp_socket_free(evpool, evsocket);
+}
+
+void 
+evhttp_thread_pool_enable_bound_socket(struct evhttp_thread_pool *evpool, struct evhttp_bound_socket *bound)
+{
+	struct evconnlistener *lev;
+
+	if (evpool == NULL)
+		return;
+
+	if (bound == NULL)
+		return;
+
+	lev = evhttp_bound_socket_get_listener(bound);
+	if (!lev) {
+		perror("listener is null");
+		return;
+	}
+
+	evconnlistener_set_cb(lev, accept_socket_cb, evpool);
 }
 
 int
