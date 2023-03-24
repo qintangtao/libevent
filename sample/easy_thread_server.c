@@ -49,17 +49,6 @@ static int use_thread_pool = 1;
 static uint64_t print_index = 0;
 
 static void
-signal_cb(evutil_socket_t sig, short events, void *user_data)
-{
-	struct event_base *base = user_data;
-	struct timeval delay = {2, 0};
-
-	printf("Caught an interrupt signal; exiting cleanly in two seconds.\n");
-
-	event_base_loopexit(base, &delay);
-}
-
-static void
 hexdump(const unsigned char *ptr, int len)
 {
 	int i;
@@ -69,7 +58,7 @@ hexdump(const unsigned char *ptr, int len)
 }
 
 static void
-conn_print(struct bufferevent *bev, const char *TAG)
+bev_print(struct bufferevent *bev, const char *TAG)
 {
 	struct sockaddr_storage ss;
 	evutil_socket_t fd = bufferevent_getfd(bev);
@@ -104,7 +93,7 @@ conn_print(struct bufferevent *bev, const char *TAG)
 }
 
 static void
-conn_readcb(struct bufferevent *bev, void *user_data)
+read_cb(struct bufferevent *bev, void *user_data)
 {
 #if 1
 	ev_ssize_t size;
@@ -113,7 +102,7 @@ conn_readcb(struct bufferevent *bev, void *user_data)
 	if ((size = evbuffer_get_length(input)) > 0)
 		evbuffer_drain(input, size);
 	
-	conn_print(bev, "Reading");
+	bev_print(bev, "Reading");
 
 #else
 	RPC_PACKET *packet;
@@ -188,7 +177,7 @@ conn_readcb(struct bufferevent *bev, void *user_data)
 }
 
 static void
-conn_writecb(struct bufferevent *bev, void *user_data)
+write_cb(struct bufferevent *bev, void *user_data)
 {
 	struct evbuffer *output = bufferevent_get_output(bev);
 	if (evbuffer_get_length(output) == 0) {
@@ -197,7 +186,7 @@ conn_writecb(struct bufferevent *bev, void *user_data)
 }
 
 static void
-conn_eventcb(struct bufferevent *bev, short events, void *user_data)
+event_cb(struct bufferevent *bev, short events, void *user_data)
 {
 	if (events & BEV_EVENT_EOF) {
 		printf("Connection closed.\n");
@@ -210,7 +199,7 @@ conn_eventcb(struct bufferevent *bev, short events, void *user_data)
 		return;
 	}
 
-	conn_print(bev, "Close");
+	bev_print(bev, "Close");
 
 	/* None of the other events can happen here, since we haven't enabled
 	 * timeouts */
@@ -222,36 +211,26 @@ create_bufferevent_socket(struct event_base *base, evutil_socket_t fd)
 {
 	struct bufferevent *bev;
 
-	// create client socket
 	bev = bufferevent_socket_new(
 		base, fd, BEV_OPT_CLOSE_ON_FREE | BEV_OPT_THREADSAFE);
-	if (bev) {
-
-		bufferevent_setcb(bev, conn_readcb, conn_writecb, conn_eventcb, NULL);
-		// bufferevent_settimeout(bev, CONN_TIMEOUT_READ, CONN_TIMEOUT_WRITE);
-		// bufferevent_enable(bev, EV_WRITE);
-		bufferevent_enable(bev, EV_READ);
-
-		conn_print(bev, "Connected");
-
-		return bev;
-
-	} else {
-		fprintf(stderr, "Error constructing bufferevent!");
-		evutil_closesocket(fd);
+	if (!bev) {
+		fprintf(stderr, "Couldn't new bufferevent socket.\n");
+		goto err;
 	}
 
-	return NULL;
-}
+	bufferevent_setcb(bev, read_cb, write_cb, event_cb, NULL);
+	// bufferevent_settimeout(bev, CONN_TIMEOUT_READ, CONN_TIMEOUT_WRITE);
+	// bufferevent_enable(bev, EV_WRITE);
+	bufferevent_enable(bev, EV_READ);
 
-static void
-new_conn_cb(struct eveasy_thread *evthread,
-	evutil_socket_t fd, struct sockaddr *sa, int socklen, void *arg)
-{
-	struct eveasy_thread_pool *pool = arg;
-	struct event_base *base = eveasy_thread_get_base(evthread);
-	
-	create_bufferevent_socket(base, fd);
+	bev_print(bev, "Connected");
+
+	return bev;
+
+err:
+	evutil_closesocket(fd);
+
+	return NULL;
 }
 
 static void
@@ -259,20 +238,33 @@ accept_socket_cb(struct evconnlistener *listener, evutil_socket_t fd,
 	struct sockaddr *sa, int socklen, void *arg)
 {
 	if (use_thread_pool) {
-		
 		struct eveasy_thread_pool *pool = arg;
-
 		eveasy_thread_pool_assign(pool, fd, sa, socklen);
-
 	} else {
-
 		struct event_base *base = arg;
-
 		create_bufferevent_socket(base, fd);
-
 	}
 }
 
+static void
+easyconn_cb(struct eveasy_thread *evthread, evutil_socket_t fd,
+	struct sockaddr *sa, int socklen, void *arg)
+{
+	struct event_base *base = eveasy_thread_get_base(evthread);
+
+	create_bufferevent_socket(base, fd);
+}
+
+static void
+signal_cb(evutil_socket_t sig, short events, void *arg)
+{
+	struct event_base *base = arg;
+	struct timeval delay = {2, 0};
+
+	printf("Caught an interrupt signal; exiting cleanly in two seconds.\n");
+
+	event_base_loopexit(base, &delay);
+}
 
 int
 main(int argc, char **argv)
@@ -330,7 +322,7 @@ main(int argc, char **argv)
 			goto err;
 		}
 
-		eveasy_thread_pool_set_conncb(pool, new_conn_cb, pool);
+		eveasy_thread_pool_set_conncb(pool, easyconn_cb, NULL);
 	}
 	
 	event_config_free(cfg);

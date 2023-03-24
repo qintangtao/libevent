@@ -631,21 +631,9 @@ static void
 accept_socket_cb(struct evconnlistener *listener, evutil_socket_t nfd,
 	struct sockaddr *peer_sa, int peer_socklen, void *arg)
 {
-#if 1
 	struct evhttp_thread_pool *pool = arg;
 
 	evhttp_thread_pool_assign(pool, nfd, peer_sa, peer_socklen);
-#else
-	struct evhttp_bound_socket *bound = arg;
-
-	struct evhttp *http = bound->http;
-
-	struct bufferevent *bev = NULL;
-	if (bound->bevcb)
-		bev = bound->bevcb(http->base, bound->bevcbarg);
-
-	evhttp_get_request(http, nfd, peer_sa, peer_socklen, bev);
-#endif
 }
 
 int
@@ -709,8 +697,6 @@ main(int argc, char **argv)
 		fprintf(stderr, "Couldn't create an event_base: exiting\n");
 		ret = 1;
 	}
-	//event_config_free(cfg);
-	//cfg = NULL;
 
 	/* Create a new evhttp object to handle requests. */
 	http = evhttp_new(base);
@@ -773,23 +759,6 @@ main(int argc, char **argv)
 		}
 	}
 
-#if 0
-	{
-		struct sockaddr_un addr;
-		struct timeval msec10 = {5, 0};
-
-		pool = evhttp_thread_pool_new(cfg, 128);
-
-		evhttp_thread_pool_assign(
-			pool, EVUTIL_INVALID_SOCKET, (struct sockaddr *)&addr, sizeof(addr));
-		
-		evutil_usleep_(&msec10);
-
-		evhttp_thread_pool_free(pool);
-	}
-#endif
-
-
 	// create http thread pool
 	pool = evhttp_thread_pool_new(cfg, 128);
 	if (pool) {
@@ -819,6 +788,8 @@ main(int argc, char **argv)
 		evconnlistener_set_cb(
 			evhttp_bound_socket_get_listener(handle), accept_socket_cb, pool);
 	}
+	event_config_free(cfg);
+	cfg = NULL;
 
 	if (display_listen_sock(handle)) {
 		ret = 1;

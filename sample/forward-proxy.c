@@ -84,7 +84,7 @@ init_proxy()
 }
 
 static void
-conn_print(struct bufferevent *bev, const char *TAG)
+bev_print(struct bufferevent *bev, const char *TAG)
 {
 	struct sockaddr_storage ss;
 	evutil_socket_t fd = bufferevent_getfd(bev);
@@ -147,7 +147,7 @@ add_bufferevent_connection(struct event_base *base, evutil_socket_t fd)
 	BEV_CONNECT_UNLOCK();
 
 	if (use_print_debug) {
-		conn_print(bev_conn->bev, "connect");
+		bev_print(bev_conn->bev, "connect");
 		fprintf(stdout, "client count: %d\n", proxy.connection_cnt);
 	}
 
@@ -249,7 +249,7 @@ event_cb(struct bufferevent *bev, short events, void *arg)
 	}
 
 	if (use_print_debug)
-		conn_print(bev, "disconnect");
+		bev_print(bev, "disconnect");
 
 	if (bev == b_out) {
 		// delay to connect
