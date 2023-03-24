@@ -45,7 +45,7 @@ typedef struct _RPC_PACKET {
 #define RPC_MAJOR_VERSION 0x01
 #define RPC_MINOR_VERSION 0x01
 
-static int use_thread_pool = 0;
+static int use_thread_pool = 1;
 static uint64_t print_index = 0;
 
 static void
@@ -301,8 +301,7 @@ main(int argc, char **argv)
 	evthread_use_windows_threads();
 	event_config_set_num_cpus_hint(cfg, si.dwNumberOfProcessors);
 #endif
-	event_config_set_flag(
-		cfg, EVENT_BASE_FLAG_STARTUP_IOCP | EVENT_BASE_FLAG_INHERIT_IOCP);
+	event_config_set_flag(cfg, EVENT_BASE_FLAG_STARTUP_IOCP | EVENT_BASE_FLAG_INHERIT_IOCP);
 #else
 #ifdef EVTHREAD_USE_PTHREADS_IMPLEMENTED
 	evthread_use_pthreads();

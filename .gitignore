@@ -172,3 +172,5 @@ rules.ninja
 # clangd
 .cache
 /build
+/build_x86_x64
+/build_x86_x64_SHARED

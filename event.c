@@ -832,7 +832,7 @@ event_base_stop_iocp_(struct event_base *base)
 #ifdef _WIN32
 	int rv;
 
-	if (!base->iocp || !base->iocp_owner)
+	if (!base->iocp_owner || !base->iocp)
 		return;
 	rv = event_iocp_shutdown_(base->iocp, -1);
 	EVUTIL_ASSERT(rv >= 0);
