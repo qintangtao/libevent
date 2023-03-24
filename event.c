@@ -840,6 +840,7 @@ event_base_stop_iocp_(struct event_base *base)
 	if (base->iocp == event_global_current_iocp_)
 		event_global_current_iocp_ = NULL;
 
+	base->iocp_owner = 0;
 	base->iocp = NULL;
 #endif
 }
