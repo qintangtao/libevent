@@ -45,7 +45,7 @@ typedef struct _RPC_PACKET {
 #define RPC_MAJOR_VERSION 0x01
 #define RPC_MINOR_VERSION 0x01
 
-static int use_thread_pool = 1;
+static int use_thread_pool = 0;
 static uint64_t print_index = 0;
 
 static void
