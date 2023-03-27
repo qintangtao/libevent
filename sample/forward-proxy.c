@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <signal.h>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -311,6 +312,17 @@ easyconn_cb(struct eveasy_thread *evthread, evutil_socket_t fd,
 }
 
 static void
+signal_cb(evutil_socket_t sig, short events, void *arg)
+{
+	struct event_base *base = arg;
+	struct timeval delay = {2, 0};
+
+	printf("Caught an interrupt signal; exiting cleanly in two seconds.\n");
+
+	event_base_loopexit(base, &delay);
+}
+
+static void
 syntax(void)
 {
 	fputs("Syntax:\n", stderr);
@@ -330,6 +342,7 @@ main(int argc, char **argv)
 	struct bufferevent *bev			= NULL;
 	struct eveasy_thread_pool *pool = NULL;
 	struct evconnlistener *listener = NULL;
+	struct event *signal_event		= NULL;
 	struct sockaddr_storage listen_on_addr;
 	int socklen, i;
 	int ret = EXIT_FAILURE;
@@ -394,12 +407,12 @@ main(int argc, char **argv)
 	}
 
 #ifdef _WIN32
-	SYSTEM_INFO si;
-	GetSystemInfo(&si);
 #ifdef EVTHREAD_USE_WINDOWS_THREADS_IMPLEMENTED
 	evthread_use_windows_threads();
-	event_config_set_num_cpus_hint(cfg, si.dwNumberOfProcessors);
 #endif
+	SYSTEM_INFO si;
+	GetSystemInfo(&si);
+	event_config_set_num_cpus_hint(cfg, si.dwNumberOfProcessors);
 	event_config_set_flag(
 		cfg, EVENT_BASE_FLAG_STARTUP_IOCP | EVENT_BASE_FLAG_INHERIT_IOCP);
 #else
@@ -443,9 +456,14 @@ main(int argc, char **argv)
 			LEV_OPT_CLOSE_ON_FREE | LEV_OPT_CLOSE_ON_EXEC | LEV_OPT_REUSEABLE,
 			-1, (struct sockaddr *)&listen_on_addr, socklen);
 	}
-
 	if (!listener) {
 		fprintf(stderr, "Couldn't open listener.\n");
+		goto err;
+	}
+
+	signal_event = evsignal_new(base, SIGINT, signal_cb, (void *)base);
+	if (!signal_event || event_add(signal_event, NULL) < 0) {
+		fprintf(stderr, "Could not create/add a signal event!\n");
 		goto err;
 	}
 
@@ -462,14 +480,18 @@ err:
 		event_config_free(cfg);
 	if (listener)
 		evconnlistener_free(listener);
-	if (base)
-		event_base_free(base);
 	if (connect_timer)
 		evtimer_del(connect_timer);
+	if (signal_event)
+		event_free(signal_event);
+	if (base)
+		event_base_free(base);
 
 #ifdef _WIN32
 	WSACleanup();
 #endif
+
+	printf("done\n");
 
 	return ret;
 }
