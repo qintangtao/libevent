@@ -96,12 +96,11 @@ static void
 read_cb(struct bufferevent *bev, void *user_data)
 {
 #if 1
-	ev_ssize_t size;
 	struct evbuffer *input = bufferevent_get_input(bev);
+	struct evbuffer *ouput = bufferevent_get_output(bev);
 
-	if ((size = evbuffer_get_length(input)) > 0)
-		evbuffer_drain(input, size);
-	
+	evbuffer_add_buffer(ouput, input);
+
 	bev_print(bev, "Reading");
 
 #else
@@ -211,16 +210,16 @@ create_bufferevent_socket(struct event_base *base, evutil_socket_t fd)
 {
 	struct bufferevent *bev;
 
-	bev = bufferevent_socket_new(
-		base, fd, BEV_OPT_CLOSE_ON_FREE | BEV_OPT_THREADSAFE);
+	bev = bufferevent_socket_new(base, fd,
+		BEV_OPT_CLOSE_ON_FREE | BEV_OPT_DEFER_CALLBACKS | BEV_OPT_THREADSAFE);
 	if (!bev) {
 		fprintf(stderr, "Couldn't new bufferevent socket.\n");
 		goto err;
 	}
 
 	bufferevent_setcb(bev, read_cb, write_cb, event_cb, NULL);
-	// bufferevent_settimeout(bev, CONN_TIMEOUT_READ, CONN_TIMEOUT_WRITE);
-	// bufferevent_enable(bev, EV_WRITE);
+	bufferevent_settimeout(bev, CONN_TIMEOUT_READ, CONN_TIMEOUT_WRITE);
+	bufferevent_enable(bev, EV_WRITE);
 	bufferevent_enable(bev, EV_READ);
 
 	bev_print(bev, "Connected");
@@ -295,13 +294,14 @@ main(int argc, char **argv)
 	}
 
 #ifdef _WIN32
-	SYSTEM_INFO si;
-	GetSystemInfo(&si);
 #ifdef EVTHREAD_USE_WINDOWS_THREADS_IMPLEMENTED
 	evthread_use_windows_threads();
-	event_config_set_num_cpus_hint(cfg, si.dwNumberOfProcessors);
 #endif
-	event_config_set_flag(cfg, EVENT_BASE_FLAG_STARTUP_IOCP | EVENT_BASE_FLAG_INHERIT_IOCP);
+	SYSTEM_INFO si;
+	GetSystemInfo(&si);
+	event_config_set_num_cpus_hint(cfg, si.dwNumberOfProcessors);
+	event_config_set_flag(
+		cfg, EVENT_BASE_FLAG_STARTUP_IOCP | EVENT_BASE_FLAG_INHERIT_IOCP);
 #else
 #ifdef EVTHREAD_USE_PTHREADS_IMPLEMENTED
 	evthread_use_pthreads();
