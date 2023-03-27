@@ -190,7 +190,7 @@ eveasy_socket_pop(struct eveasy_thread *evthread)
 }
 
 static void
-thread_process(evutil_socket_t fd, short which, void *arg)
+notify_cb(evutil_socket_t fd, short which, void *arg)
 {
 	struct eveasy_thread *evthread = arg;
 	struct eveasy_thread_pool *evpool = evthread->pool;
@@ -299,9 +299,8 @@ eveasy_thread_setup(
 	}
 
 	/* Listen for notifications from other threads */
-	evthread->notify_event =
-		event_new(evthread->base, evthread->notify_receive_fd,
-			EV_READ | EV_PERSIST, thread_process, evthread);
+	evthread->notify_event = event_new(evthread->base,
+		evthread->notify_receive_fd, EV_READ | EV_PERSIST, notify_cb, evthread);
 	event_base_set(evthread->base, evthread->notify_event);
 	if (event_add(evthread->notify_event, 0) == -1) {
 		fprintf(stderr, "Can't monitor event notify pipe\n");
