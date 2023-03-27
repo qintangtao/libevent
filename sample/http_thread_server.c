@@ -664,22 +664,19 @@ main(int argc, char **argv)
 
 	cfg = event_config_new();
 #ifdef _WIN32
-	if (o.iocp) {
 #ifdef EVTHREAD_USE_WINDOWS_THREADS_IMPLEMENTED
+	evthread_use_windows_threads();
+	if (o.iocp) {
 		SYSTEM_INFO si;
 		GetSystemInfo(&si);
-		evthread_use_windows_threads();
 		event_config_set_num_cpus_hint(cfg, si.dwNumberOfProcessors);
-#endif
-		event_config_set_flag(
-			cfg, EVENT_BASE_FLAG_STARTUP_IOCP | EVENT_BASE_FLAG_INHERIT_IOCP);
+		event_config_set_flag(cfg, EVENT_BASE_FLAG_STARTUP_IOCP | EVENT_BASE_FLAG_INHERIT_IOCP);
 	}
+#endif
 #else
-
 #ifdef EVTHREAD_USE_PTHREADS_IMPLEMENTED
 	evthread_use_pthreads();
 #endif
-
 #endif
 
 	base = event_base_new_with_config(cfg);
@@ -769,6 +766,7 @@ main(int argc, char **argv)
 				 * "generic"
 				 * cb.  We can also add callbacks for specific paths. */
 				evhttp_set_gencb(http, send_document_cb, &o);
+
 				if (o.max_body_size)
 					evhttp_set_max_body_size(http, o.max_body_size);
 			}
@@ -793,21 +791,23 @@ main(int argc, char **argv)
 
 	event_base_dispatch(base);
 
+err:
+	if (cfg)
+		event_config_free(cfg);
+	if (term)
+		event_free(term);
+	if (pool)
+		evhttp_thread_pool_free(pool);
+	if (http)
+		evhttp_free(http);
+	if (base)
+		event_base_free(base);
+
 #ifdef _WIN32
 	WSACleanup();
 #endif
 
-err:
-	if (cfg)
-		event_config_free(cfg);
-	if (http)
-		evhttp_free(http);
-	if (term)
-		event_free(term);
-	if (base)
-		event_base_free(base);
-	if (pool)
-		evhttp_thread_pool_free(pool);
+	printf("done\n");
 
 	return ret;
 }
