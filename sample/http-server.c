@@ -349,66 +349,10 @@ send_document_cb(struct evhttp_request *req, void *arg)
 			goto err;
 		}
 
-		ev_off_t offset = 0;
-		ev_off_t length = st.st_size;
-
-		/*
-			Range 常用的格式有如下几种情况：
-			Range:bytes=0-1024 ，表示传输的是从开头到第1024字节的内容；
-			Range:bytes=1025-2048 ，表示传输的是从第1025到2048字节范围的内容；
-			Range:bytes=-2000 ，表示传输的是最后2000字节的内容；
-			Range:bytes=1024-
-		   ，表示传输的是从第1024字节开始到文件结束部分的内容；
-			Range:bytes=0-0,-1 表示传输的是第一个和最后一个字节 ；
-			Range:bytes=1024-2048,2049-3096,3097-4096
-		   ，表示传输的是多个字节范围。 Content-Range Content-Range 用于响应带有
-		   Range 的请求。服务器会将 Content-Range 添加在响应的头部，格式如下：
-
-			Content-Range:bytes(unit first byte pos)-[last byte pos]/[entity
-		   length]
-
-			常见的格式内容如下：
-
-			Content-Range:bytes 2048-4096/10240
-
-			这里边 2048-4096 表示当前发送的数据范围， 10240 表示文件总大小。
-		*/
-		char *range =
-			evhttp_find_header(evhttp_request_get_input_headers(req), "Range");
-		if (range != NULL) {
-			printf("Range: <%s>\n", range);
-
-			ev_off_t offset2 = 0;
-			sscanf(range, "bytes=%d-%d", &offset, &offset2);
-			if (offset == 0 && offset2 == 0)
-				sscanf(range, "bytes=%d-", &offset);
-
-			if (offset2 > offset)
-				length = offset2 - offset + 1;			
-		}
-
-		if (offset < 0)
-			offset = 0;
-
-		if (offset + length > st.st_size)
-			length = st.st_size - offset;
-
-		printf("offset:%d, length:%d\n", offset, length);
-
 		evhttp_add_header(
 			evhttp_request_get_output_headers(req), "Content-Type", type);
 
-		if (range)
-		{
-			char content_range[512];
-			evutil_snprintf(content_range, 512, "bytes %d-%d/%d", offset,
-				offset + length - 1, st.st_size);
-			evhttp_add_header(evhttp_request_get_output_headers(req),
-				"Content-Range", content_range);
-		}
-
-		// evbuffer_add_file(evb, fd, 0, st.st_size);
-		evbuffer_add_file(evb, fd, offset, length);
+		evbuffer_add_file(evb, fd, 0, st.st_size);
 	}
 
 	evhttp_send_reply(req, HTTP_OK, "OK", evb);
