@@ -429,6 +429,9 @@ eveasy_thread_pool_assign(struct eveasy_thread_pool *evpool,
 	struct eveasy_socket *evsocket = NULL;
 	struct eveasy_thread *evthread = NULL;
 
+	if (!evpool)
+		goto error;
+
 	evsocket = eveasy_socket_new(evpool);
 	if (evsocket == NULL) {
 		goto error;

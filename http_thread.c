@@ -455,7 +455,7 @@ evhttp_thread_pool_assign(struct evhttp_thread_pool *evpool,
 	struct evhttp_thread *evthread = NULL;
 
 	if (!evpool)
-		return;
+		goto error;
 
 	evsocket = evhttp_socket_new(evpool);
 	if (evsocket == NULL) {
