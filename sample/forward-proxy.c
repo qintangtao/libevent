@@ -62,17 +62,8 @@ struct forward_proxy {
 } proxy;
 
 
-#define BEV_CONNECT_LOCK()              \
-	do {                                \
-		if (proxy.lock)                 \
-			EVLOCK_LOCK(proxy.lock, 0); \
-	} while (0)
-
-#define BEV_CONNECT_UNLOCK()              \
-	do {                                  \
-		if (proxy.lock)                   \
-			EVLOCK_UNLOCK(proxy.lock, 0); \
-	} while (0)
+#define BEV_CONNECT_LOCK()		EVLOCK_LOCK(proxy.lock, 0)
+#define BEV_CONNECT_UNLOCK()	EVLOCK_UNLOCK(proxy.lock, 0)
 
 static void
 init_proxy()
