@@ -131,7 +131,7 @@ add_bufferevent_connection(struct event_base *base, evutil_socket_t fd)
 	}
 
 	bufferevent_setcb(bev_conn->bev, NULL, NULL, event_cb, NULL);
-	bufferevent_enable(bev_conn->bev, EV_READ | EV_WRITE);
+	bufferevent_enable(bev_conn->bev, EV_WRITE);
 
 	BEV_CONNECT_LOCK();
 	TAILQ_INSERT_TAIL(&proxy.connections, bev_conn, next);
@@ -190,9 +190,24 @@ read_cb(struct bufferevent *bev, void *arg)
 	struct bufferevent_connection *bev_conn;
 	struct evbuffer *src, *dst, *tmp;
 	size_t len;
+	char buff[1024];
 
 	src = bufferevent_get_input(bev);
 	len = evbuffer_get_length(src);
+
+#if 1
+	size_t size;
+	while ((size = evbuffer_remove(src, buff, 1024)) > 0)
+	{
+		BEV_CONNECT_LOCK();
+		TAILQ_FOREACH (bev_conn, &proxy.connections, next) {
+			dst = bufferevent_get_output(bev_conn->bev);
+			evbuffer_add(dst, buff, size);
+		}
+		BEV_CONNECT_UNLOCK();
+	}
+
+#else
 
 	tmp = evbuffer_new();
 	if (tmp) {
@@ -209,6 +224,7 @@ read_cb(struct bufferevent *bev, void *arg)
 	} else {
 		evbuffer_drain(src, len);
 	}
+#endif
 }
 
 static void
