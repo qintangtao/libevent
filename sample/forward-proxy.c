@@ -40,11 +40,11 @@
 
 static struct sockaddr_storage connect_to_addr;
 static int connect_to_addrlen;
-static int use_print_debug			= 0;
-static int use_thread_pool			= 0;
-static struct timeval tv_read		= {30, 0};
-static struct timeval tv_connect	= {5, 0};
-static struct event *connect_timer	= NULL;
+static int use_print_debug = 0;
+static int use_thread_pool = 0;
+static struct timeval tv_read = {30, 0};
+static struct timeval tv_connect = {5, 0};
+static struct event *connect_timer = NULL;
 
 struct bufferevent_connection {
 	TAILQ_ENTRY(bufferevent_connection) next;
@@ -62,8 +62,8 @@ struct forward_proxy {
 } proxy;
 
 
-#define BEV_CONNECT_LOCK()		EVLOCK_LOCK(proxy.lock, 0)
-#define BEV_CONNECT_UNLOCK()	EVLOCK_UNLOCK(proxy.lock, 0)
+#define BEV_CONNECT_LOCK() EVLOCK_LOCK(proxy.lock, 0)
+#define BEV_CONNECT_UNLOCK() EVLOCK_UNLOCK(proxy.lock, 0)
 
 static void
 init_proxy()
@@ -250,7 +250,6 @@ event_cb(struct bufferevent *bev, short events, void *arg)
 		BEV_CONNECT_LOCK();
 		TAILQ_FOREACH (bev_conn, &proxy.connections, next) {
 			if (bev_conn->bev == bev) {
-				// bufferevent_free(bev_conn->bev);
 				TAILQ_REMOVE(&proxy.connections, bev_conn, next);
 				mm_free(bev_conn);
 				proxy.connection_cnt--;
@@ -328,12 +327,12 @@ syntax(void)
 int
 main(int argc, char **argv)
 {
-	struct event_config *cfg		= NULL;
-	struct event_base *base			= NULL;
-	struct bufferevent *bev			= NULL;
+	struct event_config *cfg = NULL;
+	struct event_base *base = NULL;
+	struct bufferevent *bev = NULL;
 	struct eveasy_thread_pool *pool = NULL;
 	struct evconnlistener *listener = NULL;
-	struct event *signal_event		= NULL;
+	struct event *signal_event = NULL;
 	struct sockaddr_storage listen_on_addr;
 	int socklen, i;
 	int ret = EXIT_FAILURE;
@@ -389,8 +388,6 @@ main(int argc, char **argv)
 			(struct sockaddr *)&connect_to_addr, &connect_to_addrlen) < 0)
 		syntax();
 
-	init_proxy();
-
 	cfg = event_config_new();
 	if (!cfg) {
 		fprintf(stderr, "Couldn't create an config: exiting\n");
@@ -411,6 +408,8 @@ main(int argc, char **argv)
 	evthread_use_pthreads();
 #endif
 #endif
+
+	init_proxy();
 
 	base = event_base_new_with_config(cfg);
 	if (!base) {
