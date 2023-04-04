@@ -779,7 +779,7 @@ event_base_new_with_config(const struct event_config *cfg)
 #endif
 
 #ifdef _WIN32
-	base->iocp_owner = 0;
+	base->own_iocp = 0;
 	if (cfg && (cfg->flags & EVENT_BASE_FLAG_STARTUP_IOCP)) {
 		if (cfg->flags & EVENT_BASE_FLAG_INHERIT_IOCP) {
 			if (cfg->iocp) {
@@ -819,7 +819,7 @@ event_base_start_iocp_(struct event_base *base, int n_cpus)
 		event_warnx("%s: Couldn't launch IOCP", __func__);
 		return -1;
 	}
-	base->iocp_owner = 1;
+	base->own_iocp = 1;
 	return 0;
 #else
 	return -1;
@@ -832,7 +832,7 @@ event_base_stop_iocp_(struct event_base *base)
 #ifdef _WIN32
 	int rv;
 
-	if (!base->iocp_owner || !base->iocp)
+	if (!base->own_iocp || !base->iocp)
 		return;
 	rv = event_iocp_shutdown_(base->iocp, -1);
 	EVUTIL_ASSERT(rv >= 0);
@@ -840,8 +840,8 @@ event_base_stop_iocp_(struct event_base *base)
 	if (base->iocp == event_global_current_iocp_)
 		event_global_current_iocp_ = NULL;
 
-	base->iocp_owner = 0;
 	base->iocp = NULL;
+	base->own_iocp = 0;
 #endif
 }
 

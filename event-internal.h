@@ -364,7 +364,7 @@ struct event_base {
 #ifdef _WIN32
 	/** IOCP support structure, if IOCP is enabled. */
 	struct event_iocp_port *iocp;
-	int iocp_owner;
+	int own_iocp;
 #endif
 
 	/** Flags that this base was configured with */
