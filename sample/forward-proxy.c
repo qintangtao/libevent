@@ -262,7 +262,6 @@ event_cb(struct bufferevent *bev, short events, void *arg)
 	} else {
 		// remove client from queue
 		BEV_CONNECT_LOCK();
-		bev_print(bev, "start close");
 		TAILQ_FOREACH (bev_conn, &proxy.connections, next) {
 			if (bev_conn->bev == bev) {
 				TAILQ_REMOVE(&proxy.connections, bev_conn, next);
@@ -271,7 +270,6 @@ event_cb(struct bufferevent *bev, short events, void *arg)
 				break;
 			}
 		}
-		bev_print(bev, "end close");
 		BEV_CONNECT_UNLOCK();
 
 		if (use_print_debug)
