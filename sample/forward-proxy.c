@@ -198,37 +198,31 @@ read_cb(struct bufferevent *bev, void *arg)
 	src = bufferevent_get_input(bev);
 	len = evbuffer_get_length(src);
 
-#if 0
-	char buff[1024];
-
-	while ((len = evbuffer_remove(src, buff, 1024)) > 0) {
-		BEV_CONNECT_LOCK();
-		TAILQ_FOREACH (bev_conn, &proxy.connections, next) {
-			bufferevent_write(bev_conn->bev, buff, len);
-		}
-		BEV_CONNECT_UNLOCK();
-	}
-
-#else
+	if (TAILQ_EMPTY(&proxy.connections))
+		goto done;
 
 	tmp = evbuffer_new();
-	if (tmp) {
-		evbuffer_add_buffer(tmp, src);
+	if (!tmp)
+		goto done;
 
-		BEV_CONNECT_LOCK();
-		bev_print(bev, "start read");
-		TAILQ_FOREACH (bev_conn, &proxy.connections, next) {
-			dst = bufferevent_get_output(bev_conn->bev);
-			evbuffer_add_buffer_reference(dst, tmp);
-		}
-		bev_print(bev, "end read");
-		BEV_CONNECT_UNLOCK();
+	// 多线程中开启lock
+	evbuffer_enable_locking(tmp, NULL);
+	evbuffer_add_buffer(tmp, src);
 
-		evbuffer_free(tmp);
-	} else {
-		evbuffer_drain(src, len);
+	BEV_CONNECT_LOCK();
+	TAILQ_FOREACH (bev_conn, &proxy.connections, next) {
+		dst = bufferevent_get_output(bev_conn->bev);
+		evbuffer_add_buffer_reference(dst, tmp);
 	}
-#endif
+	BEV_CONNECT_UNLOCK();
+
+	evbuffer_free(tmp);
+
+	return;
+
+done:
+
+	evbuffer_drain(src, len);
 }
 
 static void
