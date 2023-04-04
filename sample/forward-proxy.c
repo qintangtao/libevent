@@ -122,9 +122,12 @@ add_bufferevent_connection(struct event_base *base, evutil_socket_t fd)
 		goto err;
 	}
 
+	// 如果在不同的线程中使用bev， 需要加入 BEV_OPT_DEFER_CALLBACKS |BEV_OPT_UNLOCK_CALLBACKS，
+	// 因为在不同的线程中回调函数会unlock后调用, 才不会在另一个线程中和自己的锁冲突，造成互锁
 	bev_conn->base = base;
 	bev_conn->bev = bufferevent_socket_new(base, fd,
-		BEV_OPT_CLOSE_ON_FREE | BEV_OPT_DEFER_CALLBACKS | BEV_OPT_THREADSAFE);
+		BEV_OPT_CLOSE_ON_FREE | BEV_OPT_DEFER_CALLBACKS |
+			BEV_OPT_UNLOCK_CALLBACKS | BEV_OPT_THREADSAFE);
 	if (!bev_conn->bev) {
 		event_warn("%s: bufferevent socket new failed", __func__);
 		goto err;
@@ -188,7 +191,7 @@ static void
 read_cb(struct bufferevent *bev, void *arg)
 {
 	struct bufferevent_connection *bev_conn;
-	struct evbuffer *src, *dst, *tmp;
+	struct evbuffer *src;//, *dst, *tmp;
 	size_t len;
 	char buff[1024];
 
@@ -196,14 +199,14 @@ read_cb(struct bufferevent *bev, void *arg)
 	len = evbuffer_get_length(src);
 
 #if 1
-	size_t size;
-	while ((size = evbuffer_remove(src, buff, 1024)) > 0)
-	{
+
+	while ((len = evbuffer_remove(src, buff, 1024)) > 0) {
 		BEV_CONNECT_LOCK();
+		bev_print(bev, "start read");
 		TAILQ_FOREACH (bev_conn, &proxy.connections, next) {
-			dst = bufferevent_get_output(bev_conn->bev);
-			evbuffer_add(dst, buff, size);
+			bufferevent_write(bev_conn->bev, buff, len);
 		}
+		bev_print(bev, "end read");
 		BEV_CONNECT_UNLOCK();
 	}
 
@@ -264,6 +267,7 @@ event_cb(struct bufferevent *bev, short events, void *arg)
 	} else {
 		// remove client from queue
 		BEV_CONNECT_LOCK();
+		bev_print(bev, "start close");
 		TAILQ_FOREACH (bev_conn, &proxy.connections, next) {
 			if (bev_conn->bev == bev) {
 				TAILQ_REMOVE(&proxy.connections, bev_conn, next);
@@ -272,6 +276,7 @@ event_cb(struct bufferevent *bev, short events, void *arg)
 				break;
 			}
 		}
+		bev_print(bev, "end close");
 		BEV_CONNECT_UNLOCK();
 
 		if (use_print_debug)
@@ -417,8 +422,8 @@ main(int argc, char **argv)
 	SYSTEM_INFO si;
 	GetSystemInfo(&si);
 	event_config_set_num_cpus_hint(cfg, si.dwNumberOfProcessors);
-	event_config_set_flag(
-		cfg, EVENT_BASE_FLAG_STARTUP_IOCP | EVENT_BASE_FLAG_INHERIT_IOCP);
+	//event_config_set_flag(
+	//	cfg, EVENT_BASE_FLAG_STARTUP_IOCP | EVENT_BASE_FLAG_INHERIT_IOCP);
 #else
 #ifdef EVTHREAD_USE_PTHREADS_IMPLEMENTED
 	evthread_use_pthreads();

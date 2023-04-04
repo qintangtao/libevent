@@ -48,6 +48,8 @@ typedef struct _RPC_PACKET {
 static int use_thread_pool = 1;
 static uint64_t print_index = 0;
 
+const char *send_msg = "asdfasdfasdfasfasdfasdfasdfasfasdfasdfasdfasfasdfasdfasdfasfasdfasdfasdfasfasdfasdfasdfasfasdfasdfasdfasfasdfasdfasdfasfasdfasdfasdfasfasdfasdfasdfasfasdfasdfasdfasfasdfasdfasdfasfasdfasdfasdfasfasdfasdfasdfasfasdfasdfasdfasfasdfasdfasdfasf";
+
 static void
 hexdump(const unsigned char *ptr, int len)
 {
@@ -181,6 +183,7 @@ write_cb(struct bufferevent *bev, void *user_data)
 	struct evbuffer *output = bufferevent_get_output(bev);
 	if (evbuffer_get_length(output) == 0) {
 		printf("flushed answer\n");
+		//bufferevent_write(bev, send_msg, strlen(send_msg));
 	}
 }
 
@@ -219,10 +222,11 @@ create_bufferevent_socket(struct event_base *base, evutil_socket_t fd)
 
 	bufferevent_setcb(bev, read_cb, write_cb, event_cb, NULL);
 	bufferevent_settimeout(bev, CONN_TIMEOUT_READ, CONN_TIMEOUT_WRITE);
-	bufferevent_enable(bev, EV_WRITE);
-	bufferevent_enable(bev, EV_READ);
+	bufferevent_enable(bev, EV_READ | EV_WRITE);
 
 	bev_print(bev, "Connected");
+
+	//bufferevent_write(bev, send_msg, strlen(send_msg));
 
 	return bev;
 
