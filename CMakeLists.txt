@@ -1175,6 +1175,7 @@ if (NOT EVENT__DISABLE_SAMPLES)
         ws-chat-server
         http-server
         http_thread_server
+        file-server
     )
     foreach (SAMPLE ${SAMPLES_WOPT})
         add_sample_prog(OFF ${SAMPLE} sample/${SAMPLE}.c ${WIN32_GETOPT})
