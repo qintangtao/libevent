@@ -155,6 +155,8 @@ send_file(struct bufferevent *bev)
 
 	evbuffer_add_file(bufferevent_get_output(bev), fd, 0, st.st_size);
 
+	return;
+
 err:
 	if (fd >= 0)
 		close(fd);
@@ -186,10 +188,12 @@ add_bufferevent_connection(struct event_base *base, evutil_socket_t fd)
 	bufferevent_setcb(bev_conn->bev, NULL, write_cb, event_cb, NULL);
 	bufferevent_enable(bev_conn->bev, EV_WRITE);
 
+#if 0
 	BEV_CONNECT_LOCK();
 	TAILQ_INSERT_TAIL(&proxy.connections, bev_conn, next);
 	proxy.connection_cnt++;
 	BEV_CONNECT_UNLOCK();
+#endif
 
 	if (use_print_debug) {
 		bev_print(bev_conn->bev, "connect");
@@ -245,6 +249,7 @@ event_cb(struct bufferevent *bev, short events, void *arg)
 		return;
 	}
 
+#if 0
 	// remove client from queue
 	BEV_CONNECT_LOCK();
 	TAILQ_FOREACH (bev_conn, &proxy.connections, next) {
@@ -256,6 +261,7 @@ event_cb(struct bufferevent *bev, short events, void *arg)
 		}
 	}
 	BEV_CONNECT_UNLOCK();
+#endif
 
 	if (use_print_debug)
 		bev_print(bev, "disconnect");

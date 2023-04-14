@@ -174,3 +174,4 @@ rules.ninja
 /build
 /build_x86_x64
 /build_x86_x64_SHARED
+/build_x86_x64_STATIC
