@@ -62,45 +62,28 @@
 #endif
 #endif /* _WIN32 */
 
-static char *send_filename;
-static int use_print_debug = 0;
-static int use_thread_pool = 0;
-static int use_delay_send = 0;
-static int single_send_length = 1024;
-static struct timeval tv_send = {1, 0};
-static struct event *send_timer = NULL;
-
 struct bufferevent_connection {
 	TAILQ_ENTRY(bufferevent_connection) next;
 
 	struct event_base *base;
 	struct bufferevent *bev;
+	struct event *send_timer;
+	
+	ev_off_t offset;
 };
 
-struct file_server {
-	TAILQ_HEAD(bufferevent_connectionq, bufferevent_connection)
-	connections; /* queue of new connections */
-	void *lock;
+struct options {
+	int port;
+	int thread;	// use thread pool
+	int verbose; // print log
 
-	int connection_cnt;
+	int delay; // delay send
+	struct timeval tv_send;	//delay time
 
-	ev_off_t offset;
-	ev_off_t length;
-} server;
-
-
-#define BEV_CONNECT_LOCK() EVLOCK_LOCK(server.lock, 0)
-#define BEV_CONNECT_UNLOCK() EVLOCK_UNLOCK(server.lock, 0)
-
-static void
-init_server()
-{
-	server.connection_cnt = 0;
-	server.lock = NULL;
-	TAILQ_INIT(&server.connections);
-	if (use_thread_pool)
-		EVTHREAD_ALLOC_LOCK(server.lock, EVTHREAD_LOCKTYPE_READWRITE);
-}
+	char *filename;  // send file name
+	ev_off_t send_length; // send length
+	ev_off_t file_length; // file length
+} o;
 
 static void
 bev_print(struct bufferevent *bev, const char *TAG)
@@ -138,9 +121,10 @@ bev_print(struct bufferevent *bev, const char *TAG)
 static void event_cb(struct bufferevent *bev, short events, void *arg);
 static void read_cb(struct bufferevent *bev, void *arg);
 static void write_cb(struct bufferevent *bev, void *arg);
+static void time_cb(evutil_socket_t fd, short event, void *arg);
 
 static ev_off_t
-get_file_length(const char *filename)
+	get_file_length(const char *filename)
 {
 	int fd = -1;
 	struct stat st;
@@ -199,7 +183,7 @@ err:
 }
 
 static struct bufferevent_connection *
-add_bufferevent_connection(struct event_base *base, evutil_socket_t fd)
+create_bufferevent_connection(struct event_base *base, evutil_socket_t fd)
 {
 	struct bufferevent_connection *bev_conn = NULL;
 
@@ -208,6 +192,14 @@ add_bufferevent_connection(struct event_base *base, evutil_socket_t fd)
 		event_warn("%s: calloc failed", __func__);
 		goto err;
 	}
+
+	bev_conn->send_timer = evtimer_new(base, time_cb, bev_conn);
+	if (!bev_conn->send_timer) {
+		fprintf(stderr, "Could not create/add a send event!\n");
+		goto err;
+	}
+
+	bev_conn->offset = 0;
 
 	// 如果在不同的线程中使用bev， 需要加入 BEV_OPT_DEFER_CALLBACKS
 	// |BEV_OPT_UNLOCK_CALLBACKS， 因为在不同的线程中回调函数会unlock后调用,
@@ -221,27 +213,25 @@ add_bufferevent_connection(struct event_base *base, evutil_socket_t fd)
 		goto err;
 	}
 
-	bufferevent_setcb(bev_conn->bev, NULL, write_cb, event_cb, NULL);
+	bufferevent_setcb(bev_conn->bev, NULL, write_cb, event_cb, bev_conn);
 	bufferevent_enable(bev_conn->bev, EV_WRITE);
 
-	BEV_CONNECT_LOCK();
-	TAILQ_INSERT_TAIL(&server.connections, bev_conn, next);
-	server.connection_cnt++;
-	BEV_CONNECT_UNLOCK();
+	if (o.delay)
+		evtimer_add(bev_conn->send_timer, &o.tv_send);
+	else 
+		send_file(bev_conn->bev, o.filename, 0, -1);
 
-	if (use_print_debug) {
+	if (o.verbose)
 		bev_print(bev_conn->bev, "connect");
-		fprintf(stdout, "client count: %d\n", server.connection_cnt);
-	}
-
-	if (!use_delay_send)
-		send_file(bev_conn->bev, send_filename, 0, -1);
-
+	
 	return bev_conn;
 
 err:
-	if (bev_conn)
+	if (bev_conn) {
+		if (bev_conn->send_timer)
+			evtimer_del(bev_conn->send_timer);
 		mm_free(bev_conn);
+	}
 
 	evutil_closesocket(fd);
 
@@ -259,51 +249,40 @@ write_cb(struct bufferevent *bev, void *arg)
 {
 	struct evbuffer *output = bufferevent_get_output(bev);
 	if (evbuffer_get_length(output) == 0) {
-		if (use_print_debug)
+		if (o.verbose)
 			bev_print(bev, "flushed");
 
-		if (!use_delay_send)
-			send_file(bev, send_filename, 0, -1);
+		if (!o.delay)
+			send_file(bev, o.filename, 0, -1);
 	}
 }
 
 static void
 event_cb(struct bufferevent *bev, short events, void *arg)
 {
-	struct bufferevent *b_out = arg;
-	struct bufferevent_connection *bev_conn;
+	struct bufferevent_connection *bev_conn = arg;
 
 	if (events & BEV_EVENT_EOF) {
-		if (use_print_debug)
+		if (o.verbose)
 			fprintf(stdout, "Connection closed.\n");
 	} else if (events & BEV_EVENT_ERROR) {
-		if (use_print_debug)
+		if (o.verbose)
 			fprintf(stdout, "Got an error on the connection: %s\n",
 				strerror(errno)); /*XXX win32*/
 	} else if (events & BEV_EVENT_TIMEOUT) {
-		if (use_print_debug)
+		if (o.verbose)
 			fprintf(stdout, "Connection timeout.\n");
 	} else {
 		return;
 	}
 
-	// remove client from queue
-	BEV_CONNECT_LOCK();
-	TAILQ_FOREACH (bev_conn, &server.connections, next) {
-		if (bev_conn->bev == bev) {
-			TAILQ_REMOVE(&server.connections, bev_conn, next);
-			mm_free(bev_conn);
-			server.connection_cnt--;
-			break;
-		}
+	if (bev_conn) {
+		evtimer_del(bev_conn->send_timer);
+		mm_free(bev_conn);
 	}
-	BEV_CONNECT_UNLOCK();
 
-	if (use_print_debug)
+	if (o.verbose)
 		bev_print(bev, "disconnect");
-
-	if (use_print_debug)
-		fprintf(stdout, "client count: %d\n", server.connection_cnt);
 
 	bufferevent_free(bev);
 }
@@ -311,40 +290,31 @@ event_cb(struct bufferevent *bev, short events, void *arg)
 static void
 time_cb(evutil_socket_t fd, short event, void *arg)
 {
-	struct event_base *base = arg;
-	struct bufferevent_connection *bev_conn;
-	ev_off_t length = single_send_length;
+	struct bufferevent_connection *bev_conn = arg;
+	ev_off_t length = o.send_length;
 
-	if (!TAILQ_EMPTY(&server.connections))
-	{
-		if (server.offset + length > server.length)
-			length = server.length - server.offset;
+	if (bev_conn->offset + length > o.file_length)
+		length = o.file_length - bev_conn->offset;
 
-		BEV_CONNECT_LOCK();
-		TAILQ_FOREACH (bev_conn, &server.connections, next) {
-			send_file(bev_conn->bev, send_filename, server.offset, length);
-		}
-		BEV_CONNECT_UNLOCK();
+	send_file(bev_conn->bev, o.filename, bev_conn->offset, length);
 
-		server.offset += length;
-		if (server.offset >= server.length)
-			server.offset = 0;
-	}
+	bev_conn->offset += length;
+	if (bev_conn->offset >= o.file_length)
+		bev_conn->offset = 0;
 
-	if (send_timer)
-		evtimer_add(send_timer, &tv_send);
+	evtimer_add(bev_conn->send_timer, &o.tv_send);
 }
 
 static void
 accept_socket_cb(struct evconnlistener *listener, evutil_socket_t fd,
 	struct sockaddr *sa, int socklen, void *arg)
 {
-	if (use_thread_pool) {
+	if (o.thread) {
 		struct eveasy_thread_pool *pool = arg;
 		eveasy_thread_pool_assign(pool, fd, sa, socklen);
 	} else {
 		struct event_base *base = arg;
-		add_bufferevent_connection(base, fd);
+		create_bufferevent_connection(base, fd);
 	}
 }
 
@@ -353,7 +323,7 @@ easyconn_cb(struct eveasy_thread *evthread, evutil_socket_t fd,
 	struct sockaddr *sa, int socklen, void *arg)
 {
 	struct event_base *base = eveasy_thread_get_base(evthread);
-	add_bufferevent_connection(base, fd);
+	create_bufferevent_connection(base, fd);
 }
 
 static void
@@ -381,6 +351,55 @@ print_usage(FILE *out, const char *prog, int exit_code)
 	exit(exit_code);
 }
 
+static struct options
+parse_opts(int argc, char **argv)
+{
+	struct options o;
+	int opt;
+
+	memset(&o, 0, sizeof(o));
+	o.tv_send.tv_sec = 1;
+	o.tv_send.tv_usec = 0;
+	o.send_length = 1024;
+
+	while ((opt = getopt(argc, argv, "htvdl:T:")) != -1) {
+		switch (opt) {
+		case 't':
+			o.thread = 1;
+			break;
+		case 'v':
+			o.verbose = 1;
+			break;
+		case 'd':
+			o.delay = 1;
+			break;
+		case 'l':
+			o.send_length = atoi(optarg);
+			break;
+		case 'T': {
+			int ms = atoi(optarg);
+			o.tv_send.tv_sec = ms / 1000;
+			o.tv_send.tv_usec = (ms % 1000) * 1000;
+		} break;
+		case 'h':
+			print_usage(stdout, argv[0], 0);
+			break;
+		default:
+			fprintf(stderr, "Unknown option %c\n", opt);
+			break;
+		}
+	}
+
+	if (optind >= argc || (argc - optind) < 2) {
+		print_usage(stdout, argv[0], 1);
+	}
+
+	o.port = atoi(argv[optind++]);
+	o.filename = argv[optind++];
+
+	return o;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -391,6 +410,8 @@ main(int argc, char **argv)
 	struct event *signal_event = NULL;
 	struct sockaddr_in sin = {0};
 	int ret = EXIT_FAILURE;
+
+	o = parse_opts(argc, argv);
 
 #ifdef _WIN32
 	{
@@ -406,50 +427,14 @@ main(int argc, char **argv)
 	}
 #endif
 
-	int opt;
-	while ((opt = getopt(argc, argv, "htvdl:T:")) != -1) {
-		switch (opt) {
-		case 't':
-			use_thread_pool = 1;
-			break;
-		case 'v':
-			use_print_debug = 1;
-			break;
-		case 'd':
-			use_delay_send = 1;
-			break;
-		case 'l':
-			single_send_length = atoi(optarg);
-			break;
-		case 'T':
-		{
-			int ms = atoi(optarg);
-			tv_send.tv_sec = ms / 1000;
-			tv_send.tv_usec = (ms % 1000) * 1000;
-		}
-			break;
-		case 'h':
-			print_usage(stdout, argv[0], 0);
-			break;
-		default:
-			fprintf(stderr, "Unknown option %c\n", opt);
-			break;
-		}
+	o.file_length = get_file_length(o.filename);
+	if (o.file_length == -1) {
+		fprintf(stderr, "Couldn't get file length: %s\n", o.filename);
+		goto err;
 	}
 
-	if (optind >= argc || (argc - optind) < 2) {
-		print_usage(stdout, argv[0], 1);
-	}
-
-	sin.sin_family = AF_INET;
-	sin.sin_port = htons(atoi(argv[optind++]));
-
-	send_filename = argv[optind++];
-
-	server.offset = 0;
-	server.length = get_file_length(send_filename);
-	if (server.length == -1) {
-		fprintf(stderr, "Couldn't get file length: %s\n", send_filename);
+	if (o.send_length > o.file_length) {
+		fprintf(stderr, "Send length is too large\n");
 		goto err;
 	}
 
@@ -474,15 +459,13 @@ main(int argc, char **argv)
 #endif
 #endif
 
-	init_server();
-
 	base = event_base_new_with_config(cfg);
 	if (!base) {
 		fprintf(stderr, "Couldn't create an event_base: exiting\n");
 		goto err;
 	}
 
-	if (use_thread_pool) {
+	if (o.thread) {
 		pool = eveasy_thread_pool_new(cfg, 128);
 		if (!pool) {
 			fprintf(stderr, "Couldn't create an eveasy_thread_pool: exiting\n");
@@ -495,7 +478,10 @@ main(int argc, char **argv)
 	event_config_free(cfg);
 	cfg = NULL;
 
-	if (use_thread_pool) {
+	sin.sin_family = AF_INET;
+	sin.sin_port = htons(o.port);
+
+	if (o.thread) {
 		listener = evconnlistener_new_bind(base, accept_socket_cb, pool,
 			LEV_OPT_CLOSE_ON_FREE | LEV_OPT_CLOSE_ON_EXEC | LEV_OPT_REUSEABLE,
 			-1, (struct sockaddr *)&sin, sizeof(sin));
@@ -515,15 +501,6 @@ main(int argc, char **argv)
 		goto err;
 	}
 
-	send_timer = evtimer_new(base, time_cb, base);
-	if (!send_timer) {
-		fprintf(stderr, "Could not create/add a send event!\n");
-		goto err;
-	}
-
-	if (use_delay_send)
-		evtimer_add(send_timer, &tv_send);
-
 	event_base_dispatch(base);
 
 	ret = EXIT_SUCCESS;
@@ -535,8 +512,6 @@ err:
 		event_config_free(cfg);
 	if (listener)
 		evconnlistener_free(listener);
-	if (send_timer)
-		evtimer_del(send_timer);
 	if (signal_event)
 		event_free(signal_event);
 	if (base)
