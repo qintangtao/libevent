@@ -62,12 +62,13 @@
 #endif
 #endif /* _WIN32 */
 
-static char *filename;
+static char *send_filename;
 static int use_print_debug = 0;
 static int use_thread_pool = 0;
-static struct timeval tv_read = {30, 0};
-static struct timeval tv_connect = {5, 0};
-static struct event *connect_timer = NULL;
+static int use_delay_send = 0;
+static int single_send_length = 1024;
+static struct timeval tv_send = {1, 0};
+static struct event *send_timer = NULL;
 
 struct bufferevent_connection {
 	TAILQ_ENTRY(bufferevent_connection) next;
@@ -76,26 +77,29 @@ struct bufferevent_connection {
 	struct bufferevent *bev;
 };
 
-struct forward_proxy {
+struct file_server {
 	TAILQ_HEAD(bufferevent_connectionq, bufferevent_connection)
 	connections; /* queue of new connections */
 	void *lock;
 
 	int connection_cnt;
-} proxy;
+
+	ev_off_t offset;
+	ev_off_t length;
+} server;
 
 
-#define BEV_CONNECT_LOCK() EVLOCK_LOCK(proxy.lock, 0)
-#define BEV_CONNECT_UNLOCK() EVLOCK_UNLOCK(proxy.lock, 0)
+#define BEV_CONNECT_LOCK() EVLOCK_LOCK(server.lock, 0)
+#define BEV_CONNECT_UNLOCK() EVLOCK_UNLOCK(server.lock, 0)
 
 static void
-init_proxy()
+init_server()
 {
-	proxy.connection_cnt = 0;
-	proxy.lock = NULL;
-	TAILQ_INIT(&proxy.connections);
+	server.connection_cnt = 0;
+	server.lock = NULL;
+	TAILQ_INIT(&server.connections);
 	if (use_thread_pool)
-		EVTHREAD_ALLOC_LOCK(proxy.lock, EVTHREAD_LOCKTYPE_READWRITE);
+		EVTHREAD_ALLOC_LOCK(server.lock, EVTHREAD_LOCKTYPE_READWRITE);
 }
 
 static void
@@ -135,11 +139,12 @@ static void event_cb(struct bufferevent *bev, short events, void *arg);
 static void read_cb(struct bufferevent *bev, void *arg);
 static void write_cb(struct bufferevent *bev, void *arg);
 
-static void
-send_file(struct bufferevent *bev)
+static ev_off_t
+get_file_length(const char *filename)
 {
 	int fd = -1;
 	struct stat st;
+	st.st_size = -1;
 
 	if ((fd = open(filename, O_RDONLY)) < 0) {
 		perror("open");
@@ -153,7 +158,38 @@ send_file(struct bufferevent *bev)
 		goto err;
 	}
 
-	evbuffer_add_file(bufferevent_get_output(bev), fd, 0, st.st_size);
+err:
+	if (fd >= 0)
+		close(fd);
+
+	return st.st_size;
+}
+
+static void
+send_file(struct bufferevent *bev, const char *filename, ev_off_t offset,
+	ev_off_t length)
+{
+	int fd = -1;
+	//struct stat st;
+
+	if ((fd = open(filename, O_RDONLY)) < 0) {
+		perror("open");
+		goto err;
+	}
+
+#if 0
+	if (-1 == length) {
+		if (fstat(fd, &st) < 0) {
+			/* Make sure the length still matches, now that we
+			 * opened the file :/ */
+			perror("fstat");
+			goto err;
+		}
+		length = st.st_size;
+	}
+#endif
+
+	evbuffer_add_file(bufferevent_get_output(bev), fd, offset, length);
 
 	return;
 
@@ -188,19 +224,18 @@ add_bufferevent_connection(struct event_base *base, evutil_socket_t fd)
 	bufferevent_setcb(bev_conn->bev, NULL, write_cb, event_cb, NULL);
 	bufferevent_enable(bev_conn->bev, EV_WRITE);
 
-#if 0
 	BEV_CONNECT_LOCK();
-	TAILQ_INSERT_TAIL(&proxy.connections, bev_conn, next);
-	proxy.connection_cnt++;
+	TAILQ_INSERT_TAIL(&server.connections, bev_conn, next);
+	server.connection_cnt++;
 	BEV_CONNECT_UNLOCK();
-#endif
 
 	if (use_print_debug) {
 		bev_print(bev_conn->bev, "connect");
-		fprintf(stdout, "client count: %d\n", proxy.connection_cnt);
+		fprintf(stdout, "client count: %d\n", server.connection_cnt);
 	}
 
-	send_file(bev_conn->bev);
+	if (!use_delay_send)
+		send_file(bev_conn->bev, send_filename, 0, -1);
 
 	return bev_conn;
 
@@ -224,8 +259,11 @@ write_cb(struct bufferevent *bev, void *arg)
 {
 	struct evbuffer *output = bufferevent_get_output(bev);
 	if (evbuffer_get_length(output) == 0) {
-		printf("flushed answer\n");
-		send_file(bev);
+		if (use_print_debug)
+			bev_print(bev, "flushed");
+
+		if (!use_delay_send)
+			send_file(bev, send_filename, 0, -1);
 	}
 }
 
@@ -249,25 +287,23 @@ event_cb(struct bufferevent *bev, short events, void *arg)
 		return;
 	}
 
-#if 0
 	// remove client from queue
 	BEV_CONNECT_LOCK();
-	TAILQ_FOREACH (bev_conn, &proxy.connections, next) {
+	TAILQ_FOREACH (bev_conn, &server.connections, next) {
 		if (bev_conn->bev == bev) {
-			TAILQ_REMOVE(&proxy.connections, bev_conn, next);
+			TAILQ_REMOVE(&server.connections, bev_conn, next);
 			mm_free(bev_conn);
-			proxy.connection_cnt--;
+			server.connection_cnt--;
 			break;
 		}
 	}
 	BEV_CONNECT_UNLOCK();
-#endif
 
 	if (use_print_debug)
 		bev_print(bev, "disconnect");
 
 	if (use_print_debug)
-		fprintf(stdout, "client count: %d\n", proxy.connection_cnt);
+		fprintf(stdout, "client count: %d\n", server.connection_cnt);
 
 	bufferevent_free(bev);
 }
@@ -276,8 +312,27 @@ static void
 time_cb(evutil_socket_t fd, short event, void *arg)
 {
 	struct event_base *base = arg;
+	struct bufferevent_connection *bev_conn;
+	ev_off_t length = single_send_length;
 
-	
+	if (!TAILQ_EMPTY(&server.connections))
+	{
+		if (server.offset + length > server.length)
+			length = server.length - server.offset;
+
+		BEV_CONNECT_LOCK();
+		TAILQ_FOREACH (bev_conn, &server.connections, next) {
+			send_file(bev_conn->bev, send_filename, server.offset, length);
+		}
+		BEV_CONNECT_UNLOCK();
+
+		server.offset += length;
+		if (server.offset >= server.length)
+			server.offset = 0;
+	}
+
+	if (send_timer)
+		evtimer_add(send_timer, &tv_send);
 }
 
 static void
@@ -317,7 +372,10 @@ print_usage(FILE *out, const char *prog, int exit_code)
 {
 	fprintf(out,
 		"Syntax: %s [ OPTS ] <port> <file>\n"
-		" -t      - thread\n"
+		" -t      - user thread pool\n"
+		" -d      - delay send\n"
+		" -l      - single send length\n"
+		" -T      - delay millisecond send\n"
 		" -v      - verbosity, enables libevent debug logging too\n",
 		prog);
 	exit(exit_code);
@@ -349,13 +407,26 @@ main(int argc, char **argv)
 #endif
 
 	int opt;
-	while ((opt = getopt(argc, argv, "htv")) != -1) {
+	while ((opt = getopt(argc, argv, "htvdl:T:")) != -1) {
 		switch (opt) {
 		case 't':
 			use_thread_pool = 1;
 			break;
 		case 'v':
 			use_print_debug = 1;
+			break;
+		case 'd':
+			use_delay_send = 1;
+			break;
+		case 'l':
+			single_send_length = atoi(optarg);
+			break;
+		case 'T':
+		{
+			int ms = atoi(optarg);
+			tv_send.tv_sec = ms / 1000;
+			tv_send.tv_usec = (ms % 1000) * 1000;
+		}
 			break;
 		case 'h':
 			print_usage(stdout, argv[0], 0);
@@ -372,7 +443,15 @@ main(int argc, char **argv)
 
 	sin.sin_family = AF_INET;
 	sin.sin_port = htons(atoi(argv[optind++]));
-	filename = argv[optind++];
+
+	send_filename = argv[optind++];
+
+	server.offset = 0;
+	server.length = get_file_length(send_filename);
+	if (server.length == -1) {
+		fprintf(stderr, "Couldn't get file length: %s\n", send_filename);
+		goto err;
+	}
 
 	cfg = event_config_new();
 	if (!cfg) {
@@ -395,7 +474,7 @@ main(int argc, char **argv)
 #endif
 #endif
 
-	init_proxy();
+	init_server();
 
 	base = event_base_new_with_config(cfg);
 	if (!base) {
@@ -415,8 +494,6 @@ main(int argc, char **argv)
 
 	event_config_free(cfg);
 	cfg = NULL;
-
-	connect_timer = evtimer_new(base, time_cb, base);
 
 	if (use_thread_pool) {
 		listener = evconnlistener_new_bind(base, accept_socket_cb, pool,
@@ -438,6 +515,15 @@ main(int argc, char **argv)
 		goto err;
 	}
 
+	send_timer = evtimer_new(base, time_cb, base);
+	if (!send_timer) {
+		fprintf(stderr, "Could not create/add a send event!\n");
+		goto err;
+	}
+
+	if (use_delay_send)
+		evtimer_add(send_timer, &tv_send);
+
 	event_base_dispatch(base);
 
 	ret = EXIT_SUCCESS;
@@ -449,8 +535,8 @@ err:
 		event_config_free(cfg);
 	if (listener)
 		evconnlistener_free(listener);
-	if (connect_timer)
-		evtimer_del(connect_timer);
+	if (send_timer)
+		evtimer_del(send_timer);
 	if (signal_event)
 		event_free(signal_event);
 	if (base)
