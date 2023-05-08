@@ -247,12 +247,15 @@ read_cb(struct bufferevent *bev, void *arg)
 static void
 write_cb(struct bufferevent *bev, void *arg)
 {
+	struct bufferevent_connection *bev_conn = arg;
 	struct evbuffer *output = bufferevent_get_output(bev);
 	if (evbuffer_get_length(output) == 0) {
 		if (o.verbose)
 			bev_print(bev, "flushed");
 
-		if (!o.delay)
+		if (o.delay)
+			evtimer_add(bev_conn->send_timer, &o.tv_send);
+		else
 			send_file(bev, o.filename, 0, -1);
 	}
 }
@@ -301,8 +304,6 @@ time_cb(evutil_socket_t fd, short event, void *arg)
 	bev_conn->offset += length;
 	if (bev_conn->offset >= o.file_length)
 		bev_conn->offset = 0;
-
-	evtimer_add(bev_conn->send_timer, &o.tv_send);
 }
 
 static void
